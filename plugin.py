@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
+from hashlib import md5, sha1, sha256
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Set, Tuple, Type
 from urllib.parse import quote, urlsplit
@@ -36,6 +36,8 @@ REPLY_LIMITS = {"group": (300, 5), "private": (3600, 4)}
 MAX_PENDING_DISPATCHES = 32
 MAX_INBOUND_ATTACHMENTS = 10
 MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
+# 官方预上传要求的 md5_10m：文件前 10002432 字节的 MD5。
+MD5_10M_BYTES = 10002432
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
 TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn")
 ID_MAP_FILE_NAME = "id_map.json"
@@ -892,7 +894,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         route_type="duplex",
         platform=PLATFORM,
         protocol="qq_official",
-        description="QQ 官方机器人群 @ 与单聊文本消息网关",
+        description="QQ 官方机器人群聊与单聊消息网关（文本、@、图片、表情）",
     )
     async def handle_qq_official_gateway(
         self,
@@ -904,48 +906,136 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         del route, metadata, kwargs
         if not self._ready:
             return {"success": False, "error": "QQ 官方消息网关未就绪"}
+        sent_ids: List[str] = []
         try:
             # 统一 ID 反查回 OpenID 后才能调用官方 API
             reverse_map = {kind: {v: k for k, v in mapping.items()} for kind, mapping in self._id_map.items()}
-            scene, target, body = encode_message(message, reverse_map=reverse_map)
-            session = self._require_session()
-            token = await self._authorize()
+            scene, target, parts = encode_message(message, reverse_map=reverse_map)
             # 被动回复窗口按入站记录的统一 ID 匹配（encode 返回的 target 已反查为 OpenID）。
             route_target = self._id_map.get("group" if scene == "group" else "user", {}).get(target, target)
-            async with self._reply_lock:
-                reply_to = str(message.get("reply_to") or "").strip()
-                if reply_to:
-                    key = (scene, route_target, reply_to)
+            reply_to = str(message.get("reply_to") or "").strip()
+            base_path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}"
+            # 官方一条消息只承载一种内容，文本与图片按原顺序逐条发送。
+            for part in parts:
+                if part["kind"] == "media":
+                    file_info = await self._upload_image(base_path, part["binary"], part["file_name"])
+                    body: Dict[str, Any] = {"msg_type": 7, "media": {"file_info": file_info}}
                 else:
-                    candidates = (key for key in self._replies if key[:2] == (scene, route_target))
-                    key = max(candidates, key=lambda candidate: self._replies[candidate][0], default=None)
-                reference = self._replies.get(key) if key is not None else None
-                passive_fields: Dict[str, Any] = {}
-                if reference is not None:
-                    received_at, used = reference
-                    ttl, limit = REPLY_LIMITS[scene]
-                    if time.time() - received_at < ttl and used < limit:
-                        # HTTP 超时无法证明 QQ 未接受消息，发起发送后不再复用该序号。
-                        sequence = used + 1
-                        self._replies[key] = (received_at, sequence)
-                        passive_fields = {"msg_id": key[2], "msg_seq": sequence}
-                # 没有入站上下文或被动窗口已失效时省略 msg_id/msg_seq，
-                # 由平台按主动消息额度受理，发送是否成功以平台响应为准。
-            path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}/messages"
-            async with session.post(
-                self._api_url(path),
-                headers={"Authorization": f"QQBot {token}"},
-                json={**body, **passive_fields},
-            ) as response:
-                result = await response.json()
-                if response.status >= 400 or not isinstance(result, Mapping) or not result.get("id"):
-                    raise RuntimeError(
-                        f"QQ 发送失败: HTTP {response.status}, code={result.get('code') if isinstance(result, Mapping) else 'unknown'}"
-                    )
-            return {"success": True, "external_message_id": str(result["id"])}
+                    body = part["body"]
+                passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
+                result = await self._api_post(f"{base_path}/messages", {**body, **passive_fields})
+                if not result.get("id"):
+                    raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
+                sent_ids.append(str(result["id"]))
+            return {"success": True, "external_message_id": sent_ids[0]}
         except Exception as exc:
+            if sent_ids:
+                exc = RuntimeError(f"已发送 {len(sent_ids)} 条后失败: {exc}")
             self.ctx.logger.warning("QQ 官方消息发送失败: %s", exc)
             return {"success": False, "error": str(exc)}
+
+    async def _claim_passive_fields(self, scene: str, route_target: str, reply_to: str) -> Dict[str, Any]:
+        """为一次发送占用被动回复序号；无入站上下文或被动窗口已失效时返回空字典。
+
+        省略 msg_id/msg_seq 时由平台按主动消息额度受理，发送是否成功以平台响应为准。
+        """
+        async with self._reply_lock:
+            if reply_to:
+                key: Optional[Tuple[str, str, str]] = (scene, route_target, reply_to)
+            else:
+                candidates = (key for key in self._replies if key[:2] == (scene, route_target))
+                key = max(candidates, key=lambda candidate: self._replies[candidate][0], default=None)
+            reference = self._replies.get(key) if key is not None else None
+            if key is None or reference is None:
+                return {}
+            received_at, used = reference
+            ttl, limit = REPLY_LIMITS[scene]
+            if time.time() - received_at >= ttl or used >= limit:
+                return {}
+            # HTTP 超时无法证明 QQ 未接受消息，发起发送后不再复用该序号。
+            sequence = used + 1
+            self._replies[key] = (received_at, sequence)
+            return {"msg_id": key[2], "msg_seq": sequence}
+
+    async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
+        session = self._require_session()
+        token = await self._authorize()
+        async with session.post(
+            self._api_url(path),
+            headers={"Authorization": f"QQBot {token}"},
+            json=dict(payload),
+        ) as response:
+            text = await response.text()
+            try:
+                result = json.loads(text) if text.strip() else {}
+            except ValueError:
+                result = None
+            if response.status >= 400 or not isinstance(result, Mapping):
+                detail = (
+                    f"code={result.get('code')} message={result.get('message')}"
+                    if isinstance(result, Mapping)
+                    else text[:200]
+                )
+                raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
+        return result
+
+    async def _upload_image(self, base_path: str, binary: bytes, file_name: str) -> str:
+        """按官方分片上传流程上传图片，返回用于 msg_type=7 的 file_info。
+
+        流程：upload_prepare 取预签名分片 URL → 逐片 PUT 并 upload_part_finish → 携带 upload_id 调用 files 合并。
+        """
+        prepare = await self._api_post(
+            f"{base_path}/upload_prepare",
+            {
+                "file_type": 1,
+                "file_size": str(len(binary)),
+                "file_name": file_name,
+                "md5": md5(binary).hexdigest(),
+                "sha1": sha1(binary).hexdigest(),
+                "md5_10m": md5(binary[:MD5_10M_BYTES]).hexdigest(),
+            },
+        )
+        upload_id = str(prepare.get("upload_id") or "")
+        block_size = int(prepare.get("block_size") or 0)
+        upload_parts = prepare.get("parts")
+        if not upload_id or block_size <= 0 or not isinstance(upload_parts, list) or not upload_parts:
+            raise RuntimeError("QQ 图片预上传响应缺少 upload_id、block_size 或 parts")
+        # 文档写分片序号从 0 开始，实测（2026-09-30）返回从 1 开始，按实际最小序号计算偏移。
+        index_base = min(int(upload_part["index"]) for upload_part in upload_parts)
+        if index_base not in (0, 1):
+            raise RuntimeError(f"QQ 图片预上传返回的分片序号起点无效: {index_base}")
+        session = self._require_session()
+        for upload_part in upload_parts:
+            index = int(upload_part["index"])
+            presigned_url = str(upload_part.get("presigned_url") or "")
+            if not presigned_url.startswith("https://"):
+                raise RuntimeError(f"QQ 图片分片 {index} 的预签名地址无效")
+            offset = (index - index_base) * block_size
+            chunk = binary[offset : offset + block_size]
+            if not chunk:
+                raise RuntimeError(f"QQ 图片分片 {index} 超出文件范围")
+            # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头。
+            async with session.put(presigned_url, data=chunk) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"QQ 图片分片 {index} 上传失败: HTTP {response.status}")
+            await self._api_post(
+                f"{base_path}/upload_part_finish",
+                {
+                    "upload_id": upload_id,
+                    "part_index": index,
+                    "block_size": str(len(chunk)),
+                    "md5": md5(chunk).hexdigest(),
+                },
+            )
+        result = await self._api_post(
+            f"{base_path}/files",
+            {"file_type": 1, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
+        )
+        file_info = str(result.get("file_info") or "")
+        if not file_info:
+            raise RuntimeError("QQ 图片上传响应缺少 file_info")
+        return file_info
 
 
 def create_plugin() -> QQOfficialAdapterPlugin:

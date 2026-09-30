@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import base64
+import binascii
+import hashlib
 import json
 import re
 
@@ -83,8 +86,8 @@ def decode_message(
         content = ""
     is_at = _is_bot_mentioned(event_type, payload, content, account_id)
     # <@id> 协议标记对用户不可读：@ 机器人由 is_at 表达，@ 他人转写为标准 at 段。
-    content, mention_segments, mention_texts = _rewrite_mention_tokens(content, account_id, bot_name, payload, user_map)
-    if not content and not segments and not mention_segments:
+    content, body_segments, body_plain_text = _rewrite_mention_tokens(content, account_id, bot_name, payload, user_map)
+    if not content and not segments and not body_segments:
         raise ValueError("消息不包含文本或可处理的附件")
 
     timestamp = payload.get("timestamp")
@@ -106,11 +109,8 @@ def decode_message(
             "group_name": str(payload.get("group_name") or ""),
         }
 
-    raw_message: List[Dict[str, Any]] = list(mention_segments)
-    if content:
-        raw_message.append({"type": "text", "data": content})
-    raw_message.extend(segments)
-    processed_plain_text = " ".join(part for part in [*mention_texts, content, *labels] if part)
+    raw_message: List[Dict[str, Any]] = [*body_segments, *segments]
+    processed_plain_text = " ".join(part for part in [body_plain_text, *labels] if part)
 
     message = {
         "message_id": message_id,
@@ -201,43 +201,76 @@ def _rewrite_mention_tokens(
         if mention_id and name:
             display_names[mention_id] = name
 
-    at_segments: List[Dict[str, Any]] = []
-    mention_texts: List[str] = []
-
-    def _replace(match: re.Match) -> str:
+    # 按原文顺序切分为文本片段与 at 段，保持 "文本A @x 文本B @y 文本C" 的穿插位置。
+    # pieces 元素：str 为文本；tuple(at 段, 可读标签) 为 @。
+    pieces: List[Any] = []
+    cursor = 0
+    for match in QQ_MENTION_TOKEN_PATTERN.finditer(content):
+        pieces.append(content[cursor : match.start()])
+        cursor = match.end()
         mention_id = match.group(1)
         if mention_id == account_id:
-            at_segments.append(
+            pieces.append(
+                (
+                    {
+                        "type": "at",
+                        "data": {
+                            "target_user_id": account_id,
+                            "target_user_nickname": bot_name or None,
+                            "target_user_cardname": None,
+                        },
+                    },
+                    f"@{bot_name}" if bot_name else "",
+                )
+            )
+            continue
+        name = display_names.get(mention_id)
+        if not name:
+            continue
+        pieces.append(
+            (
                 {
                     "type": "at",
                     "data": {
-                        "target_user_id": account_id,
-                        "target_user_nickname": bot_name or None,
+                        "target_user_id": user_map.get(mention_id, mention_id),
+                        "target_user_nickname": name,
                         "target_user_cardname": None,
                     },
-                }
-            )
-            if bot_name:
-                mention_texts.append(f"@{bot_name}")
-            return ""
-        name = display_names.get(mention_id)
-        if not name:
-            return ""
-        at_segments.append(
-            {
-                "type": "at",
-                "data": {
-                    "target_user_id": user_map.get(mention_id, mention_id),
-                    "target_user_nickname": name,
-                    "target_user_cardname": None,
                 },
-            }
+                f"@{name}",
+            )
         )
-        mention_texts.append(f"@{name}")
-        return ""
+    pieces.append(content[cursor:])
 
-    content = QQ_MENTION_TOKEN_PATTERN.sub(_replace, content).strip()
-    return content, at_segments, mention_texts
+    # 合并相邻文本（被丢弃的未知 @ 会让文本相邻），并去掉整体首尾空白。
+    merged: List[Any] = []
+    for piece in pieces:
+        if isinstance(piece, str) and merged and isinstance(merged[-1], str):
+            merged[-1] += piece
+        else:
+            merged.append(piece)
+    if merged and isinstance(merged[0], str):
+        merged[0] = merged[0].lstrip()
+    if merged and isinstance(merged[-1], str):
+        merged[-1] = merged[-1].rstrip()
+
+    ordered_segments: List[Dict[str, Any]] = []
+    plain_parts: List[str] = []
+    text_parts: List[str] = []
+    for index, piece in enumerate(merged):
+        if isinstance(piece, str):
+            if piece:
+                ordered_segments.append({"type": "text", "data": piece})
+                plain_parts.append(piece)
+                text_parts.append(piece)
+            continue
+        at_segment, label = piece
+        ordered_segments.append(at_segment)
+        if label:
+            following = merged[index + 1] if index + 1 < len(merged) else ""
+            needs_space = isinstance(following, str) and following and not following[0].isspace()
+            plain_parts.append(label + (" " if needs_space else ""))
+    return "".join(text_parts).strip(), ordered_segments, "".join(plain_parts).strip()
 
 
 def _is_bot_mentioned(event_type: str, payload: Mapping[str, Any], content: str, account_id: str) -> bool:
@@ -298,12 +331,17 @@ def extract_command_text(payload: Mapping[str, Any]) -> str:
 def encode_message(
     message: Mapping[str, Any],
     reverse_map: Optional[Mapping[str, Mapping[str, str]]] = None,
-) -> Tuple[str, str, Dict[str, Any]]:
-    """提取出站目标并构造消息体；不默默丢弃未支持的消息段。
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """提取出站目标并按原顺序切分为待发送的消息部分；不默默丢弃未支持的消息段。
 
     统一 ID 需经 ``reverse_map``（{"group": {统一ID: OpenID}, "user": {...}}）反查回
     OpenID 才能调用官方 API；无映射时按原值发送。
-    含 @ 时以 markdown（msg_type=2）发送，否则为纯文本（msg_type=0）。
+
+    官方一条消息只能承载一种内容，因此：
+    - 连续的文本/@ 段合并为一个 ``{"kind": "body", "body": {...}}``，含 @ 时以 markdown
+      （msg_type=2）发送，否则为纯文本（msg_type=0）；
+    - 每个图片/表情段单独成为一个 ``{"kind": "media", "binary": bytes, "file_name": str}``，
+      由插件上传后以富媒体（msg_type=7）发送。
     """
     message_info = message.get("message_info")
     if not isinstance(message_info, Mapping):
@@ -323,9 +361,20 @@ def encode_message(
 
     segments = message.get("raw_message")
     if not isinstance(segments, list) or not segments:
-        raise ValueError("出站消息缺少文本段")
+        raise ValueError("出站消息缺少消息段")
+    outbound: List[Dict[str, Any]] = []
     parts: List[str] = []
     use_markdown = False
+
+    def _flush_text() -> None:
+        nonlocal use_markdown
+        text = "".join(parts).strip()
+        if text:
+            body = {"msg_type": 2, "markdown": {"content": text}} if use_markdown else {"msg_type": 0, "content": text}
+            outbound.append({"kind": "body", "body": body})
+        parts.clear()
+        use_markdown = False
+
     for segment in segments:
         if not isinstance(segment, Mapping):
             raise ValueError("出站消息段格式无效")
@@ -349,15 +398,48 @@ def encode_message(
                 # 纯数字是未绑定 OpenID 的 QQ 号，无法 @，退化为可读 @昵称。
                 parts.append(f"@{at_nickname} ")
             continue
+        if segment.get("type") in {"image", "emoji"}:
+            _flush_text()
+            outbound.append({"kind": "media", **_decode_image_segment(segment)})
+            continue
         if segment.get("type") != "text":
-            raise ValueError("首版仅支持文本出站，不支持图片、语音或表情组件")
+            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片与表情")
         data = segment.get("data")
         if not isinstance(data, str):
             raise ValueError("出站文本段的数据必须是字符串")
         parts.append(data)
-    text = "".join(parts).strip()
-    if not text:
-        raise ValueError("出站文本为空")
-    if use_markdown:
-        return scene, target_id, {"msg_type": 2, "markdown": {"content": text}}
-    return scene, target_id, {"msg_type": 0, "content": text}
+    _flush_text()
+    if not outbound:
+        raise ValueError("出站消息为空")
+    return scene, target_id, outbound
+
+
+def _decode_image_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
+    """取出图片/表情段的二进制数据，并按文件头确定上传文件名。"""
+    raw_base64 = str(segment.get("binary_data_base64") or "").strip()
+    if not raw_base64:
+        raise ValueError(f"出站{segment.get('type')}段缺少二进制数据")
+    try:
+        binary = base64.b64decode(raw_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError(f"出站{segment.get('type')}段的二进制数据不是有效的 Base64") from None
+    extension = _detect_image_extension(binary)
+    if not extension:
+        raise ValueError(f"出站{segment.get('type')}段不是可识别的图片格式")
+    name = str(segment.get("hash") or "").strip() or hashlib.sha256(binary).hexdigest()
+    return {"binary": binary, "file_name": f"{name}.{extension}"}
+
+
+def _detect_image_extension(binary: bytes) -> str:
+    """按文件头识别官方富媒体支持的图片格式，无法识别时返回空串。"""
+    if binary.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if binary.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if binary.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if binary[:4] == b"RIFF" and binary[8:12] == b"WEBP":
+        return "webp"
+    if binary.startswith(b"BM"):
+        return "bmp"
+    return ""
