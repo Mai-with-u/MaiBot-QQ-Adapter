@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+config.local.toml
+config_back/
+.env
+config.toml
+id_map.json
