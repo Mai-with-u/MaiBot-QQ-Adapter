@@ -62,10 +62,8 @@ def decode_message(
     user_map = (id_map or {}).get("user") or {}
     unified_group = str(group_map.get(group_id) or "") if group_id else ""
     unified_user = str(user_map.get(user_id) or "")
-    additional_config: Dict[str, Any] = {"self_id": account_id}
-    if unified_account_id:
-        # platform_io_account_id 优先级高于 self_id，主程序按它计算 session 归属。
-        additional_config["platform_io_account_id"] = unified_account_id
+    # 主程序通过正式 account_id 字段计算 session 归属，扩展配置只保存平台专属数据。
+    additional_config: Dict[str, Any] = {}
     if is_group:
         additional_config["qq_official_group_openid"] = group_id
         additional_config["platform_io_target_group_id"] = unified_group or group_id
@@ -116,6 +114,8 @@ def decode_message(
         "message_id": message_id,
         "timestamp": str(received_at),
         "platform": PLATFORM,
+        "account_id": unified_account_id or account_id,
+        "scope": None,
         "message_info": message_info,
         "raw_message": raw_message,
         "processed_plain_text": processed_plain_text,

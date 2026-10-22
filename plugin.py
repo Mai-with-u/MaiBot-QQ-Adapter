@@ -457,7 +457,6 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             accepted = await self.ctx.gateway.route_message(
                 gateway_name=GATEWAY_NAME,
                 message=message,
-                route_metadata={"self_id": self._account_id},
                 external_message_id=message_id,
                 dedupe_key=message_id,
             )

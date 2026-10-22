@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.3 - 2026-10-23
+
+### 修复
+
+- 消息归属：通过正式 account_id/scope 字段传递机器人身份，保留统一账号映射，不再在 additional_config 或 route_metadata 中写入身份字段。
+
 ## 0.4.2 - 2026-10-22
 
 ### 修复
