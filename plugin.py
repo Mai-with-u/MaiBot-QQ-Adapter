@@ -702,6 +702,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
     @Tool(
         MUTE_TOOL_NAME,
+        platforms=PLATFORM,
         description=(
             "在 QQ 群聊中根据消息 ID 禁言该消息的发送者。"
             "适用于刷屏、违规发言等情况。群主与管理员平台不允许禁言；"
@@ -838,6 +839,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
     @Tool(
         RECALL_TOOL_NAME,
+        platforms=PLATFORM,
         description=(
             "撤回一条 QQ 消息。发送超过 2 分钟的消息不可撤回；"
             "群聊中机器人是群管理员时可撤回自己和普通群成员的消息，否则只能撤回自己发送的消息；"
