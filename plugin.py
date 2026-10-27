@@ -979,8 +979,18 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 else:
                     body = part["body"]
                 # 引用样式只挂在第一条分片；message_reference 与被动凭证 msg_id/msg_seq 互不替代。
-                reference_fields = self._build_message_reference(quote_target) if index == 0 else {}
-                if index == 0 and quote_target and not reference_fields:
+                # 但 msg_type=2 的 markdown（含 @ 段）携带引用会在 Mac QQ / 部分手机 QQ
+                # 重复渲染正文（卡片 + 纯文本），因此 markdown 不挂引用，文本/图片照常。
+                supports_reference = body.get("msg_type") != 2
+                if index == 0 and supports_reference:
+                    reference_fields = self._build_message_reference(quote_target)
+                else:
+                    reference_fields = {}
+                if index == 0 and quote_target and not supports_reference:
+                    self.ctx.logger.debug(
+                        "Markdown 消息不携带 message_reference 以避免客户端重复渲染: target=%s", quote_target
+                    )
+                elif index == 0 and quote_target and not reference_fields:
                     self.ctx.logger.debug(
                         "QQ 官方出站缺少引用索引，消息不携带 message_reference: target=%s", quote_target
                     )
