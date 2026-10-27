@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4 - 2026-10-27
+
+### 修复
+
+- 回复引用：出站消息携带官方 `message_reference`（REFIDX），QQ 客户端正确渲染回复引用样式。此前仅发送 `msg_id/msg_seq`（被动回复额度凭证，本身不产生引用），导致后台显示回复引用但 QQ 客户端没有引用样式。
+- 入站解析 `message_scene.ext` 的 `msg_idx` 并建立“平台消息 ID → REFIDX”映射，自发消息同时保存响应 `ext_info.ref_idx`；`codec` 出站不再丢弃 reply 段。查不到引用索引时按无引用降级发送，不阻断消息。
+
 ## 0.4.3 - 2026-10-23
 
 ### 修复

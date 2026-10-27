@@ -70,6 +70,13 @@ def decode_message(
     else:
         additional_config["platform_io_target_user_id"] = unified_user or user_id
     additional_config["qq_official_user_openid"] = user_id
+    # 官方引用索引（message_scene.ext 的 msg_idx）：出站 message_reference 只能用 REFIDX，
+    # 不能用消息 id（ROBOT1.0_...）；ref_msg_idx 表示用户这条消息本身引用了谁。
+    msg_idx, ref_msg_idx = extract_message_scene_fields(payload)
+    if msg_idx:
+        additional_config["qq_official_msg_idx"] = msg_idx
+    if ref_msg_idx:
+        additional_config["qq_official_ref_msg_idx"] = ref_msg_idx
     if unified_user:
         user_id = unified_user
     if unified_group:
@@ -159,6 +166,32 @@ def _extract_content(payload: Mapping[str, Any]) -> str:
             if isinstance(nested_content, str) and nested_content.strip():
                 parts.append(nested_content.strip())
     return "".join(parts).strip()
+
+
+def extract_message_scene_fields(payload: Mapping[str, Any]) -> Tuple[str, str]:
+    """解析 message_scene.ext，返回 (msg_idx, ref_msg_idx)。
+
+    ext 形如 ["msg_idx=REFIDX_xxx==", "auth_token=...", "ref_msg_idx=TMP_xxx"]；
+    msg_idx 是本条消息用于被引用的索引，ref_msg_idx 是本条消息引用的目标索引。
+    字段缺失或结构异常时返回空串，由调用方按无引用降级。
+    """
+
+    scene = payload.get("message_scene")
+    if not isinstance(scene, Mapping):
+        return "", ""
+    ext = scene.get("ext")
+    if not isinstance(ext, list):
+        return "", ""
+    msg_idx = ""
+    ref_msg_idx = ""
+    for item in ext:
+        if not isinstance(item, str):
+            continue
+        if item.startswith("msg_idx="):
+            msg_idx = item[len("msg_idx=") :].strip()
+        elif item.startswith("ref_msg_idx="):
+            ref_msg_idx = item[len("ref_msg_idx=") :].strip()
+    return msg_idx, ref_msg_idx
 
 
 def summarize_payload(payload: Mapping[str, Any]) -> str:
@@ -331,7 +364,7 @@ def extract_command_text(payload: Mapping[str, Any]) -> str:
 def encode_message(
     message: Mapping[str, Any],
     reverse_map: Optional[Mapping[str, Mapping[str, str]]] = None,
-) -> Tuple[str, str, List[Dict[str, Any]]]:
+) -> Tuple[str, str, List[Dict[str, Any]], str]:
     """提取出站目标并按原顺序切分为待发送的消息部分；不默默丢弃未支持的消息段。
 
     统一 ID 需经 ``reverse_map``（{"group": {统一ID: OpenID}, "user": {...}}）反查回
@@ -342,6 +375,9 @@ def encode_message(
       （msg_type=2）发送，否则为纯文本（msg_type=0）；
     - 每个图片/表情段单独成为一个 ``{"kind": "media", "binary": bytes, "file_name": str}``，
       由插件上传后以富媒体（msg_type=7）发送。
+
+    返回的第四项为 reply 段指向的被回复消息 ID（平台消息 id，非 REFIDX），
+    由调用方转换为官方 message_reference；无 reply 段时为空串。
     """
     message_info = message.get("message_info")
     if not isinstance(message_info, Mapping):
@@ -365,6 +401,7 @@ def encode_message(
     outbound: List[Dict[str, Any]] = []
     parts: List[str] = []
     use_markdown = False
+    reply_target_id = ""
 
     def _flush_text() -> None:
         nonlocal use_markdown
@@ -379,6 +416,15 @@ def encode_message(
         if not isinstance(segment, Mapping):
             raise ValueError("出站消息段格式无效")
         if segment.get("type") == "reply":
+            # reply 段不进入正文，但需把被回复消息 id 交给调用方，由其映射为
+            # 官方 message_reference（REFIDX），否则 QQ 客户端不显示引用样式。
+            reply_data = segment.get("data")
+            if isinstance(reply_data, Mapping):
+                reply_target_id = str(
+                    reply_data.get("target_message_id") or reply_data.get("message_id") or ""
+                ).strip()
+            elif isinstance(reply_data, str):
+                reply_target_id = reply_data.strip()
             continue
         if segment.get("type") == "at":
             # 实测（2026-09-30）：<@openid> 与 <qqbot-at-user /> 在纯文本消息里都显示成代码原文，
@@ -411,7 +457,7 @@ def encode_message(
     _flush_text()
     if not outbound:
         raise ValueError("出站消息为空")
-    return scene, target_id, outbound
+    return scene, target_id, outbound, reply_target_id
 
 
 def _decode_image_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
