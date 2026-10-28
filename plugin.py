@@ -13,8 +13,8 @@ import json
 import re
 import time
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
-from maibot_sdk import API, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
+from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .codec import (
@@ -29,6 +29,7 @@ from .codec import (
     summarize_payload,
 )
 from .settings import AdapterSettings
+from .qr_login import QRLogin, save_credentials
 
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
@@ -54,6 +55,46 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
     config_model: ClassVar[Optional[Type[PluginConfigBase]]] = AdapterSettings
 
+    config_widgets: ClassVar[List[ConfigWidget]] = [
+        ConfigWidget(id="connection", kind="status", label="连接状态"),
+        ConfigWidget(id="login", kind="qrcode", label="QQ 扫码授权"),
+        ConfigWidget(id="login_start", kind="action", label="生成 / 刷新二维码",
+                     confirmation="扫码授权成功后将替换 AppID / AppSecret 并重新连接，是否继续？"),
+        ConfigWidget(id="login_cancel", kind="action", label="取消扫码"),
+        ConfigWidget(id="reconnect", kind="action", label="重新连接"),
+    ]
+
+    async def get_config_widget_state(self) -> Dict[str, ConfigWidgetState]:
+        login = self._qr_login.snapshot()
+        active = login["state"] in {"creating", "waiting", "saving"}
+        configured = bool(self.config.qq_official.app_id.strip() and self.config.qq_official.app_secret.strip())
+        connection = (f"已连接：{self._bot_name or self._account_id}" if self._ready
+                      else "连接中 / 等待重连" if self._worker is not None and not self._worker.done()
+                      else "尚未连接" if configured else "请扫码授权或填写 AppID / AppSecret")
+        return {
+            "connection": ConfigWidgetState(text=connection, tone="success" if self._ready else "neutral"),
+            "login": ConfigWidgetState(text=login["message"], image=login["image"] or None,
+                                       expires_at=login["expires_at"],
+                                       visible=active or not self._ready or login["state"] in {"error", "expired"},
+                                       tone="error" if login["state"] == "error" else "neutral"),
+            "login_start": ConfigWidgetState(disabled=login["state"] in {"creating", "saving"}),
+            "login_cancel": ConfigWidgetState(visible=active, disabled=login["state"] == "saving"),
+            "reconnect": ConfigWidgetState(disabled=not configured or active),
+        }
+
+    async def on_config_widget_action(self, action_id: str) -> None:
+        if action_id == "login_start":
+            await self.webui_login_start()
+        elif action_id == "login_cancel":
+            await self.webui_login_cancel()
+        elif action_id == "reconnect":
+            async with self._connection_lock:
+                await self._stop()
+                if self.config.plugin.enabled:
+                    self._start()
+        else:
+            raise ValueError(f"未知配置页操作: {action_id}")
+
     def __init__(self) -> None:
         super().__init__()
         self._worker: Optional[asyncio.Task[None]] = None
@@ -75,23 +116,57 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._id_map: Dict[str, Any] = {"group": {}, "user": {}}
         self._unified_account_id = ""
         self._assign_admin_ids: List[str] = []
+        self._connection_lock = asyncio.Lock()
+        self._qr_login = QRLogin(self._apply_qr_credentials)
+        self._gateway_state_lock = asyncio.Lock()
+        self._inbound_ready = asyncio.Event()
 
     async def on_load(self) -> None:
+        # 页面在连接关闭或凭据尚未填写时也需要展示已有绑定。
+        await asyncio.to_thread(self._load_id_map)
         await self._sync_tool_states()
         if self.config.plugin.enabled:
             self._start()
 
     async def on_unload(self) -> None:
+        await self._qr_login.cancel()
         await self._stop()
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         if scope != "self":
             return
-        self.set_plugin_config(config_data)
-        await self._sync_tool_states()
-        await self._stop()
-        if self.config.plugin.enabled:
+        async with self._connection_lock:
+            self.set_plugin_config(config_data)
+            await self._sync_tool_states()
+            await self._stop()
+            if self.config.plugin.enabled:
+                self._start()
+
+    async def _apply_qr_credentials(self, app_id: str, secret: str) -> None:
+        """保存至插件配置并立即应用，重启后仍使用同一机器人凭据。"""
+        async with self._connection_lock:
+            config_data = await asyncio.to_thread(save_credentials, Path(__file__).with_name("config.toml"), app_id, secret)
+            self.set_plugin_config(config_data)
+            await self._stop()
             self._start()
+
+    @API("webui_login_status", description="查询 QQ 扫码授权及连接状态", version="1", public=True)
+    async def webui_login_status(self) -> Dict[str, Any]:
+        return {
+            **self._qr_login.snapshot(),
+            "connected": self._ready,
+            "enabled": self.config.plugin.enabled,
+            "configured_app_id": self.config.qq_official.app_id,
+            "bot_name": self._bot_name,
+        }
+
+    @API("webui_login_start", description="发起 QQ 官方机器人扫码登录", version="1", public=True)
+    async def webui_login_start(self) -> Dict[str, Any]:
+        return await self._qr_login.start()
+
+    @API("webui_login_cancel", description="取消当前 QQ 扫码登录", version="1", public=True)
+    async def webui_login_cancel(self) -> Dict[str, Any]:
+        return await self._qr_login.cancel()
 
     async def _sync_tool_states(self) -> None:
         """按 [mute].enabled、[recall].enabled 同步可选 LLM 工具的启停状态。"""
@@ -121,7 +196,6 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             return
         self._unified_account_id = settings.unified_account_id.strip()
         self._assign_admin_ids = [str(item).strip() for item in settings.assign_admin_ids if str(item).strip()]
-        self._load_id_map()
         self._worker = asyncio.create_task(self._run(), name="qq-official-adapter")
 
     async def _stop(self) -> None:
@@ -129,6 +203,15 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._worker = None
         if worker is not None:
             worker.cancel()
+        # 只有主动停止（卸载、禁用、切换配置）才取消已接收任务，普通断线保留它们。
+        # 先取消投递任务释放状态锁，再等待网关的离线清理。
+        tasks = tuple(self._dispatch_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatch_tasks.clear()
+        if worker is not None:
             with suppress(asyncio.CancelledError):
                 await worker
         await self._disconnect()
@@ -142,6 +225,49 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
     def _id_map_path(self) -> Path:
         return self.ctx.paths.data_dir / ID_MAP_FILE_NAME
+
+    @API("webui_group_mappings", description="查看已有的 QQ 群 OpenID 与群号映射", version="1", public=True)
+    async def webui_group_mappings(self) -> Dict[str, Any]:
+        """返回当前生效的群绑定快照，不包含用户映射。"""
+        groups = [
+            {"group_openid": openid, "group_id": group_id}
+            for openid, group_id in sorted(self._id_map["group"].items(), key=lambda item: (item[1], item[0]))
+        ]
+        return {"total": len(groups), "groups": groups}
+
+    @API("webui_mappings", description="查看 QQ 群和用户的 OpenID 绑定", version="1", public=True)
+    async def webui_mappings(self) -> Dict[str, Any]:
+        """为映射页面返回独立快照。"""
+        return {
+            kind: [
+                {"openid": openid, "id": value}
+                for openid, value in sorted(self._id_map[kind].items(), key=lambda item: (item[1], item[0]))
+            ]
+            for kind in ("group", "user")
+        }
+
+    @API("webui_mapping_avatar", description="获取已绑定群或用户的头像", version="1", public=True)
+    async def webui_mapping_avatar(self, kind: str, openid: str) -> Dict[str, str]:
+        """隔离页面不能访问外网，将已绑定对象的小尺寸头像转为内嵌图片。"""
+        if kind not in {"group", "user"} or openid not in self._id_map[kind]:
+            raise ValueError("群或用户映射不存在")
+        resource = await self.api_get_avatar(PLATFORM, openid, kind)
+        if resource["status"] != "available":
+            return {"image": "", "message": "绑定 ID 不是数字，无法获取 QQ 头像"}
+        url = resource["url"].replace("/640", "/100").replace("s=640", "s=100")
+        async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+            async with session.get(url, allow_redirects=False) as response:
+                if response.status != 200:
+                    raise ValueError(f"QQ 头像请求失败: HTTP {response.status}")
+                mime = response.content_type
+                if mime not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+                    raise ValueError("QQ 头像返回了不支持的图片格式")
+                data = bytearray()
+                async for chunk in response.content.iter_chunked(16384):
+                    data.extend(chunk)
+                    if len(data) > 256 * 1024:
+                        raise ValueError("QQ 头像超过 256 KiB")
+        return {"image": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}
 
     def _load_id_map(self) -> None:
         """加载统一 ID 映射；文件缺失或损坏时按空映射启动，绑定命令会重建文件。"""
@@ -261,15 +387,26 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             self._session = session
             try:
                 while True:
+                    retry = True
+                    delay = self.config.advanced.reconnect_delay_sec
                     try:
-                        await self._connect()
+                        close_code = await self._connect()
+                        retry = self._handle_gateway_close(close_code)
+                        if close_code == 4008:
+                            delay = max(delay, 60.0)
                     except asyncio.CancelledError:
                         raise
+                    except ClientResponseError as exc:
+                        if exc.status == 401:
+                            self._invalidate_token()
+                        self.ctx.logger.warning("QQ 官方网关 HTTP 请求失败，将重试: %s", exc)
                     except Exception as exc:
                         self.ctx.logger.warning("QQ 官方网关连接失败，将重试: %s", exc)
                     finally:
                         await self._disconnect()
-                    await asyncio.sleep(self.config.qq_official.reconnect_delay_sec)
+                    if not retry:
+                        break
+                    await asyncio.sleep(delay)
             finally:
                 self._session = None
 
@@ -301,7 +438,30 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             raise RuntimeError("QQ 官方适配器 HTTP 会话未就绪")
         return self._session
 
-    async def _connect(self) -> None:
+    def _invalidate_token(self) -> None:
+        self._access_token = ""
+        self._token_expires_at = 0.0
+
+    def _reset_gateway_session(self) -> None:
+        """重置恢复游标；账号身份保留给断线前已接收的任务。"""
+        self._session_id = ""
+        self._seq = None
+        self._resuming = False
+
+    def _handle_gateway_close(self, code: Optional[int]) -> bool:
+        """根据官方关闭码处理凭据、恢复游标及不可重试错误。"""
+        if code in {4914, 4915}:
+            self.ctx.logger.error("QQ 官方网关不可恢复地断开: code=%s，请检查机器人上线状态及平台权限", code)
+            return False
+        if code == 4004:
+            self._invalidate_token()
+        elif code in {4006, 4007, 4009} or (code is not None and 4900 <= code <= 4913):
+            self._reset_gateway_session()
+            self._invalidate_token()
+        self.ctx.logger.warning("QQ 官方网关已断开: code=%s，将%s", code, "等待至少 60 秒重连" if code == 4008 else "重连")
+        return True
+
+    async def _connect(self) -> Optional[int]:
         session = self._require_session()
         token = await self._authorize()
         auth = {"Authorization": f"QQBot {token}"}
@@ -318,6 +478,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     await self._handle_gateway_payload(frame.json())
                 elif frame.type in {WSMsgType.ERROR, WSMsgType.CLOSE, WSMsgType.CLOSED}:
                     break
+            # aiohttp 的迭代器可能直接结束而不产出 CLOSE 帧，需从连接读取最终关闭码。
+            return ws.close_code
 
     async def _handle_gateway_payload(self, payload: Mapping[str, Any]) -> None:
         op = payload.get("op")
@@ -377,7 +539,10 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     if len(self._dispatch_tasks) >= MAX_PENDING_DISPATCHES:
                         self.ctx.logger.warning("QQ 官方消息处理队列已满，丢弃事件: %s", data.get("id"))
                     else:
-                        task = asyncio.create_task(self._receive_message(event, data), name="qq-official-event")
+                        task = asyncio.create_task(
+                            self._receive_message(event, data, account_id=self._account_id, bot_name=self._bot_name),
+                            name="qq-official-event",
+                        )
                         self._dispatch_tasks.add(task)
                         task.add_done_callback(self._on_dispatch_done)
         elif op == 1:
@@ -385,11 +550,10 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         elif op == 11:
             self._heartbeat_ack = True
         elif op in {7, 9}:
-            if op == 9:
-                self._session_id = ""
-                self._seq = None
-                self._account_id = ""
-                self._bot_name = ""
+            if op == 9 and data is not True:
+                # INVALID_SESSION 的 d=true 允许恢复；不可恢复时才重新鉴权和 Identify。
+                self._reset_gateway_session()
+                self._invalidate_token()
             if self._ws is not None:
                 await self._ws.close()
 
@@ -419,7 +583,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             raise RuntimeError("QQ WebSocket 未连接")
         await self._ws.send_json(dict(payload))
 
-    async def _receive_message(self, event: str, data: Mapping[str, Any]) -> None:
+    async def _receive_message(self, event: str, data: Mapping[str, Any], *, account_id: str, bot_name: str) -> None:
         try:
             # 管理命令（/assign_group_id、/assign_id）在解码前拦截，不进入聊天流。
             command = extract_command_text(data)
@@ -430,12 +594,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             message, scene, target = decode_message(
                 event,
                 data,
-                self._account_id,
+                account_id,
                 attachment_segments=segments,
                 attachment_labels=labels,
                 is_picture=is_picture,
                 is_emoji=is_emoji,
-                bot_name=self._bot_name,
+                bot_name=bot_name,
                 id_map=self._id_map,
                 unified_account_id=self._unified_account_id,
             )
@@ -454,12 +618,19 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             inserted = key not in self._replies
             self._replies.setdefault(key, (float(message["timestamp"]), 0))
         try:
-            accepted = await self.ctx.gateway.route_message(
-                gateway_name=GATEWAY_NAME,
-                message=message,
-                external_message_id=message_id,
-                dedupe_key=message_id,
-            )
+            # Host 拒收未就绪网关的消息。等待恢复，并与离线声明互斥，避免检查后断线的竞态。
+            while True:
+                await self._inbound_ready.wait()
+                async with self._gateway_state_lock:
+                    if not self._ready:
+                        continue
+                    accepted = await self.ctx.gateway.route_message(
+                        gateway_name=GATEWAY_NAME,
+                        message=message,
+                        external_message_id=message_id,
+                        dedupe_key=message_id,
+                    )
+                    break
         except BaseException:
             if inserted:
                 async with self._reply_lock:
@@ -610,19 +781,24 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             return "<无效>"
 
     async def _set_ready(self, ready: bool, *, force: bool = False) -> None:
-        if self._ready == ready and not force:
-            return
-        accepted = await self.ctx.gateway.update_state(
-            gateway_name=GATEWAY_NAME,
-            ready=ready,
-            platform=PLATFORM,
-            # 统一账号模式下路由身份跟随统一账号，否则入站 RouteKey 与注册身份不一致会被接收路由表丢弃
-            account_id=self._unified_account_id or self._account_id,
-            metadata={"connection": "qq_official"},
-        )
-        self._ready = ready and accepted
-        if ready and not accepted:
-            raise RuntimeError("MaiBot 未接受 QQ 官方消息网关路由")
+        async with self._gateway_state_lock:
+            if self._ready == ready and not force:
+                return
+            self._ready = False
+            self._inbound_ready.clear()
+            accepted = await self.ctx.gateway.update_state(
+                gateway_name=GATEWAY_NAME,
+                ready=ready,
+                platform=PLATFORM,
+                # 统一账号模式下路由身份跟随统一账号，否则入站 RouteKey 与注册身份不一致会被接收路由表丢弃
+                account_id=self._unified_account_id or self._account_id,
+                metadata={"connection": "qq_official", "protocol": "qq_official"},
+            )
+            self._ready = ready and accepted
+            if self._ready:
+                self._inbound_ready.set()
+            if ready and not accepted:
+                raise RuntimeError("MaiBot 未接受 QQ 官方消息网关路由")
 
     async def _disconnect(self) -> None:
         self._resuming = False
@@ -638,11 +814,6 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None
-        for task in tuple(self._dispatch_tasks):
-            task.cancel()
-        if self._dispatch_tasks:
-            await asyncio.gather(*tuple(self._dispatch_tasks), return_exceptions=True)
-        self._dispatch_tasks.clear()
         await self._set_ready(False)
 
     def _resolve_group_openid(self, group_id: str) -> str:
