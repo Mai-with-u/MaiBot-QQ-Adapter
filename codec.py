@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import base64
 import binascii
 import hashlib
-import json
 import re
 
 PLATFORM = "qq"
@@ -146,6 +145,9 @@ def _extract_content(payload: Mapping[str, Any]) -> str:
     for element in payload.get("msg_elements") or []:
         if not isinstance(element, Mapping):
             continue
+        # type 103 是引用的旧消息，不是当前正文/命令；不展开其图片或子元素。
+        if element.get("message_type") in (103, "103") or element.get("type") in (103, "103"):
+            continue
         for value in (element.get("content"), element.get("text")):
             if isinstance(value, str) and value.strip():
                 parts.append(value.strip())
@@ -162,13 +164,10 @@ def _extract_content(payload: Mapping[str, Any]) -> str:
 
 
 def summarize_payload(payload: Mapping[str, Any]) -> str:
-    """返回用于拒绝日志的 payload 结构摘要，截断以避免刷屏。"""
-
-    try:
-        summary = json.dumps(payload, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        summary = str(payload)
-    return summary[:600]
+    """只统计已知结构，不回显事件值、未知键、标识符或媒体地址。"""
+    return " ".join(f"{key}={len(value) if isinstance(value, list) else 0}"
+                    for key in ("attachments", "msg_elements", "mentions")
+                    for value in (payload.get(key),))
 
 
 def _rewrite_mention_tokens(
@@ -300,6 +299,8 @@ def _tree_mentions_bot(value: Any, account_id: str) -> bool:
     if isinstance(value, list):
         return any(_tree_mentions_bot(item, account_id) for item in value)
     if not isinstance(value, Mapping):
+        return False
+    if value.get("message_type") in (103, "103") or value.get("type") in (103, "103"):
         return False
     element_type = str(value.get("type") or value.get("element_type") or "").lower()
     looks_like_mention = "at" in element_type or "mention" in element_type
