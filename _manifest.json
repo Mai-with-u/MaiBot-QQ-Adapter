@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "Mai-with-u.qq-adapter",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "name": "QQ 官方机器人适配器",
   "description": "直连 QQ 开放平台官方 API，支持群聊与单聊的文本、@、图片、表情收发，提供禁言、撤回工具。",
   "author": {
@@ -27,7 +27,7 @@
   },
   "sdk": {
     "min_version": "2.19.0",
-    "max_version": "2.99.99"
+    "max_version": "2.98.99"
   },
   "dependencies": [
     {"type": "python_package", "name": "pillow", "version_spec": ">=9"},
