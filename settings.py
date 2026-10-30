@@ -66,6 +66,9 @@ class RecallSettings(PluginConfigBase):
 
 
 class AdvancedSettings(PluginConfigBase):
+    reference_cache_enabled: bool = Field(default=True, description="缓存引用索引与原作者；按账号和会话隔离，最多保留30天")
+    reference_history_fallback: bool = Field(default=False, description="索引失配时以完整原文匹配作者候选；标注历史匹配依据，多作者同文不认定")
+
     __ui_label__: ClassVar[str] = "高级设置"
     __ui_order__: ClassVar[int] = 4
 
@@ -84,3 +87,4 @@ class AdapterSettings(PluginConfigBase):
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)
+
