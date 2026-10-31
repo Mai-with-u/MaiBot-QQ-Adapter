@@ -10,7 +10,7 @@ class PluginSettings(PluginConfigBase):
     __ui_order__: ClassVar[int] = 0
 
     enabled: bool = Field(default=False, description="启用 QQ 官方机器人连接")
-    config_version: str = Field(default="0.4.1", description="配置版本")
+    config_version: str = Field(default="0.4.2", description="配置版本")
 
 
 class QQOfficialSettings(PluginConfigBase):
@@ -25,15 +25,15 @@ class QQOfficialSettings(PluginConfigBase):
         json_schema_extra={"label": "AppSecret", "x-widget": "password"},
     )
     api_base_url: str = Field(default="https://api.bot.qq.com", description="QQ 开放平台 API 地址")
-    reconnect_delay_sec: float = Field(default=5.0, ge=1.0, le=300.0, description="断线重连间隔（秒）")
     unified_account_id: str = Field(
         default="",
         description="统一账号 ID（如 NapCat 机器人 QQ 号）；非空时聊天流按此 ID 归属，与其它 qq 适配器共享上下文",
-        json_schema_extra={"label": "统一账号 ID"},
+        json_schema_extra={"label": "关联QQ号"},
     )
     assign_admin_ids: List[str] = Field(
         default_factory=list,
         description="允许执行 /assign_group_id 与 /assign_id 的用户 ID（统一 ID 或 OpenID）；留空不限制",
+        json_schema_extra={"label": "QQ Bot管理员账号"},
     )
 
 
@@ -65,8 +65,22 @@ class RecallSettings(PluginConfigBase):
     )
 
 
+class AdvancedSettings(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "高级设置"
+    __ui_order__: ClassVar[int] = 4
+
+    reconnect_delay_sec: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=300.0,
+        description="断线后等待多久重新连接，单位为秒",
+        json_schema_extra={"label": "断线重连间隔（秒）"},
+    )
+
+
 class AdapterSettings(PluginConfigBase):
     plugin: PluginSettings = Field(default_factory=PluginSettings)
     qq_official: QQOfficialSettings = Field(default_factory=QQOfficialSettings)
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
+    advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)

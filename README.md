@@ -4,7 +4,7 @@
 
 ## 部署
 
-需要 MaiBot >= 1.3.7；禁言和撤回工具仅在 QQ 平台提供。
+需要 MaiBot >= 1.3.18；禁言和撤回工具仅在 QQ 平台提供。
 
 1. 在 [QQ 开放平台](https://q.qq.com/)完成开发者入驻并创建机器人，在控制台取得 **AppID** 与 **AppSecret（ClientSecret）**。在控制台为机器人开通群聊/单聊相关能力。QQ 的 OpenID 不是普通 QQ 号。
 2. 在 WebUI 的「QQ 官方机器人适配器 → QQ 开放平台」配置中填写 **AppID** 和 **AppSecret**。
@@ -15,13 +15,12 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "0.4.1"
+config_version = "0.4.2"
 
 [qq_official]
 app_id = "你的 AppID"
 app_secret = "你的 AppSecret"
 api_base_url = "https://api.bot.qq.com"
-reconnect_delay_sec = 5.0
 # 可选：统一账号 ID（如 NapCat 机器人 QQ 号）。填写后聊天流按该 ID 归属，
 # 与同一 platform 下的其它适配器（如 SnowLuma/NapCat）共享上下文。
 unified_account_id = ""
@@ -37,6 +36,10 @@ allowed_groups = []
 enabled = true
 # 留空时允许所有群使用撤回工具，单聊不受群白名单限制。
 allowed_groups = []
+
+[advanced]
+# 断线重连间隔（秒）。
+reconnect_delay_sec = 5.0
 ```
 
 ## 出站消息
@@ -46,7 +49,17 @@ allowed_groups = []
 - 图片/表情走官方分片上传（`upload_prepare` → 分片 PUT → `upload_part_finish` → `files` 合并）取得 `file_info`，再以 `msg_type=7` 发送。
 - 语音、文件出站暂不支持，会直接返回发送失败。
 
-## 统一 ID 绑定命令
+## 扫码登录
+
+启用适配器后，在 WebUI「适配器管理 → QQ 官方机器人适配器」配置页点击「生成 / 刷新二维码」，使用手机 QQ 扫码并在官方页面完成机器人授权。成功后会将 AppID / AppSecret 原子保存到本插件的 `config.toml`，自动启用并连接；页面显示 AppID、机器人名称和实际连接状态，不显示 AppSecret。已有机器人凭据会被替换，请确认扫码授权的是目标机器人。
+
+支持取消扫码、过期后重新生成二维码；二维码最多等待 5 分钟，官方提前返回过期时也会停止。关闭页面不会取消已经发起的授权，可重新打开查看进度。保存阶段会完成写入及连接切换后再结束，避免出现已取消但凭据仍被替换的情况。原有手动配置方式继续可用。
+
+协议参考腾讯官方 [OpenClaw QQBot 登录实现](https://github.com/tencent-connect/openclaw-qqbot/blob/89988812442583bf47c34b89f9abf5fd4b85df0b/src/setup/login.ts)及其 `@tencent-connect/qqbot-connector@1.2.0`：创建绑定任务、轮询结果、使用 AES-256-GCM 解密凭据；二维码在本地生成。插件依赖由 `_manifest.json` 声明，无需 Node.js。
+
+## 查看及绑定 ID 映射
+
+WebUI 侧边栏「插件扩展 → QQ 群与用户映射」分别展示群 OpenID 对应的群号、用户 OpenID 对应的 QQ 号，以及头像、类型图标和绑定数量；执行绑定命令后点击刷新即可更新。页面为只读，无绑定时显示命令提示。头像按需加载，失败时显示原因；非数字绑定 ID 无法获取 QQ 头像。
 
 QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 QQ 号归属（与 NapCat 系适配器的数据统一），可在聊天内发送绑定命令：
 
@@ -90,3 +103,12 @@ QQ 开放平台官方 API 目前没有提供戳一戳接口（截至 2026-09-16 
 ## 参考致谢
 
 - [qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter)（作者：[清蒸云鸭](https://github.com/WhiteCloudOL)）：为本适配器开发提供了参考和借鉴。
+
+
+## 配置页运行时控件
+
+需要支持运行时控件的新版主程序及 SDK >= 2.19.0。
+
+启用适配器后，在配置页点击“生成 / 刷新二维码”，使用手机 QQ 授权。配置页同时显示连接状态，并可取消扫码或重新连接。扫码成功后 AppID / AppSecret 沿用原有配置保存流程；二维码、临时密钥和实时状态不写入 TOML。群与用户映射扩展页继续保留。
+
+本地开发可设置 `MAIBOT_PLUGIN_SDK_PATH` 指向新版 SDK 仓库，然后重启主程序。
