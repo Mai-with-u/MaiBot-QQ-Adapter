@@ -40,7 +40,7 @@ MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
 # 官方预上传要求的 md5_10m：文件前 10002432 字节的 MD5。
 MD5_10M_BYTES = 10002432
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
-TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn")
+TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
 ASSIGN_GROUP_COMMAND = "/assign_group_id"
 ASSIGN_USER_COMMAND = "/assign_id"
