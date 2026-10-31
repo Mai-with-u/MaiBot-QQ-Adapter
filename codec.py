@@ -85,7 +85,7 @@ def decode_message(
     is_at = _is_bot_mentioned(event_type, payload, content, account_id)
     # <@id> 协议标记对用户不可读：@ 机器人由 is_at 表达，@ 他人转写为标准 at 段。
     content, body_segments, body_plain_text = _rewrite_mention_tokens(content, account_id, bot_name, payload, user_map)
-    if not content and not segments and not body_segments:
+    if not content and not segments and not body_segments and not _extract_element_content(payload):
         raise ValueError("消息不包含文本或可处理的附件")
 
     timestamp = payload.get("timestamp")
@@ -140,10 +140,20 @@ def _extract_content(payload: Mapping[str, Any]) -> str:
     """顶层 content 优先；全量群消息（GROUP_MESSAGE_CREATE）的文本在 msg_elements 里。"""
 
     content = str(payload.get("content") or "").strip()
-    if content:
+    scene = payload.get("message_scene")
+    ext = scene.get("ext") if isinstance(scene, Mapping) else None
+    is_reference = isinstance(payload.get("message_reference"), Mapping)
+    if isinstance(ext, list):
+        is_reference = is_reference or any(isinstance(e, str) and e.startswith("ref_msg_idx=") for e in ext)
+    if content or is_reference:
         return content
+    return _extract_element_content(payload)
+
+
+def _extract_element_content(payload: Mapping[str, Any]) -> str:
     parts: List[str] = []
-    for element in payload.get("msg_elements") or []:
+    elements = payload.get("msg_elements")
+    for element in elements if isinstance(elements, list) else []:
         if not isinstance(element, Mapping):
             continue
         for value in (element.get("content"), element.get("text")):
@@ -443,3 +453,4 @@ def _detect_image_extension(binary: bytes) -> str:
     if binary.startswith(b"BM"):
         return "bmp"
     return ""
+

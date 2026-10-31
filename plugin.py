@@ -28,6 +28,7 @@ from .codec import (
     extract_command_text,
     summarize_payload,
 )
+from .reference_context import attach_reference_context, cache_reference, reference_scope
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
 
@@ -591,9 +592,19 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 await self._handle_assign_command(command, event, data)
                 return
             segments, labels, is_picture, is_emoji = await self._build_attachments(data)
+            routed_data = data
+            if self.config.advanced.reference_cache_enabled:
+                try:
+                    routed_data = await asyncio.to_thread(
+                        cache_reference, self.ctx.paths.data_dir / "reference_index.sqlite3",
+                        reference_scope(account_id, event, data), data,
+                        history_fallback=self.config.advanced.reference_history_fallback,
+                    )
+                except Exception:
+                    self.ctx.logger.warning("引用缓存不可用，本条消息按平台原始信息处理")
             message, scene, target = decode_message(
                 event,
-                data,
+                routed_data,
                 account_id,
                 attachment_segments=segments,
                 attachment_labels=labels,
@@ -603,6 +614,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 id_map=self._id_map,
                 unified_account_id=self._unified_account_id,
             )
+            attach_reference_context(message, routed_data)
         except ValueError as exc:
             self.ctx.logger.info("忽略 QQ 官方消息: %s | payload=%s", exc, summarize_payload(data))
             return
@@ -1110,6 +1122,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         del route, metadata, kwargs
         if not self._ready:
             return {"success": False, "error": "QQ 官方消息网关未就绪"}
+        reference_account_id = self._account_id
         sent_ids: List[str] = []
         try:
             # 统一 ID 反查回 OpenID 后才能调用官方 API
@@ -1131,6 +1144,16 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 if not result.get("id"):
                     raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
                 sent_ids.append(str(result["id"]))
+                if self.config.advanced.reference_cache_enabled:
+                    try:
+                        ext = result.get("ext_info")
+                        idx = ext.get("ref_idx") if isinstance(ext, dict) else None
+                        record = {"id": str(result["id"]), "author": {"id": reference_account_id, "username": self._bot_name}, "content": body.get("content") or (body.get("markdown") or {}).get("content") or "[图片或附件]"}
+                        scope_key = json.dumps([reference_account_id, scene, target])
+                        await asyncio.to_thread(cache_reference, self.ctx.paths.data_dir / "reference_index.sqlite3", scope_key, {}, (record, [str(result["id"]), idx]))
+                    except Exception:
+                        self.ctx.logger.warning("发送成功，但引用缓存保存失败")
+
             return {"success": True, "external_message_id": sent_ids[0]}
         except Exception as exc:
             if sent_ids:
@@ -1244,3 +1267,4 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
 def create_plugin() -> QQOfficialAdapterPlugin:
     return QQOfficialAdapterPlugin()
+
