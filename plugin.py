@@ -26,6 +26,7 @@ from .codec import (
     decode_message,
     encode_message,
     extract_command_text,
+    extract_message_scene_fields,
     summarize_payload,
 )
 from .settings import AdapterSettings
@@ -34,6 +35,9 @@ from .qr_login import QRLogin, save_credentials
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
 REPLY_LIMITS = {"group": (300, 5), "private": (3600, 4)}
+# 官方引用索引（REFIDX）没有与被动回复一致的有效期，按 24 小时保留并限制条目数，防内存无限增长。
+REF_IDX_TTL_SEC = 24 * 3600
+MAX_REF_IDX_ENTRIES = 2000
 MAX_PENDING_DISPATCHES = 32
 MAX_INBOUND_ATTACHMENTS = 10
 MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
@@ -111,6 +115,9 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._resuming = False
         self._heartbeat_ack = True
         self._replies: Dict[Tuple[str, str, str], Tuple[float, int]] = {}
+        # 平台消息 id（ROBOT1.0_...）→ 官方引用索引（REFIDX），入站取 message_scene.ext.msg_idx，
+        # 自发消息取发送响应 ext_info.ref_idx；用于出站 message_reference 渲染引用样式。
+        self._ref_idx: Dict[str, Tuple[float, str]] = {}
         self._reply_lock = asyncio.Lock()
         self._dispatch_tasks: Set[asyncio.Task[None]] = set()
         self._id_map: Dict[str, Any] = {"group": {}, "user": {}}
@@ -216,6 +223,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 await worker
         await self._disconnect()
         self._replies.clear()
+        self._ref_idx.clear()
         self._session_id = ""
         self._seq = None
         self._account_id = ""
@@ -369,13 +377,22 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if not openid:
             self.ctx.logger.warning("QQ 管理命令回执缺少目标 OpenID")
             return
+        command_msg_idx = extract_message_scene_fields(data)[0]
         try:
             session = self._require_session()
             token = await self._authorize()
+            payload: Dict[str, Any] = {
+                "content": text,
+                "msg_type": 0,
+                "msg_id": str(data.get("id") or ""),
+                "msg_seq": 1,
+            }
+            if command_msg_idx:
+                payload["message_reference"] = {"message_id": command_msg_idx}
             async with session.post(
                 self._api_url(path),
                 headers={"Authorization": f"QQBot {token}"},
-                json={"content": text, "msg_type": 0, "msg_id": str(data.get("id") or ""), "msg_seq": 1},
+                json=payload,
             ) as response:
                 if response.status >= 400:
                     self.ctx.logger.warning("QQ 管理命令回执失败: HTTP %s", response.status)
@@ -608,6 +625,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             return
         message_id = message["message_id"]
         key = (scene, target, message_id)
+        inbound_config = message.get("message_info", {}).get("additional_config", {})
+        inbound_msg_idx = str(inbound_config.get("qq_official_msg_idx") or "").strip() if isinstance(inbound_config, Mapping) else ""
         async with self._reply_lock:
             now = time.time()
             self._replies = {
@@ -617,6 +636,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             }
             inserted = key not in self._replies
             self._replies.setdefault(key, (float(message["timestamp"]), 0))
+            if inbound_msg_idx:
+                self._store_ref_idx(message_id, inbound_msg_idx, received_at=float(message["timestamp"]))
         try:
             # Host 拒收未就绪网关的消息。等待恢复，并与离线声明互斥，避免检查后断线的竞态。
             while True:
@@ -1114,22 +1135,48 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         try:
             # 统一 ID 反查回 OpenID 后才能调用官方 API
             reverse_map = {kind: {v: k for k, v in mapping.items()} for kind, mapping in self._id_map.items()}
-            scene, target, parts = encode_message(message, reverse_map=reverse_map)
+            scene, target, parts, reply_target_id = encode_message(message, reverse_map=reverse_map)
             # 被动回复窗口按入站记录的统一 ID 匹配（encode 返回的 target 已反查为 OpenID）。
             route_target = self._id_map.get("group" if scene == "group" else "user", {}).get(target, target)
             reply_to = str(message.get("reply_to") or "").strip()
+            # reply 段是宿主明确指定的引用目标；没有段时回退到消息级 reply_to。
+            quote_target = reply_target_id or reply_to
             base_path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}"
             # 官方一条消息只承载一种内容，文本与图片按原顺序逐条发送。
-            for part in parts:
+            for index, part in enumerate(parts):
                 if part["kind"] == "media":
                     file_info = await self._upload_image(base_path, part["binary"], part["file_name"])
                     body: Dict[str, Any] = {"msg_type": 7, "media": {"file_info": file_info}}
                 else:
                     body = part["body"]
+                # 引用样式只挂在第一条分片；message_reference 与被动凭证 msg_id/msg_seq 互不替代。
+                # 但 msg_type=2 的 markdown（含 @ 段）携带引用会在 Mac QQ / 部分手机 QQ
+                # 重复渲染正文（卡片 + 纯文本），因此 markdown 不挂引用，文本/图片照常。
+                supports_reference = body.get("msg_type") != 2
+                if index == 0 and supports_reference:
+                    reference_fields = self._build_message_reference(quote_target)
+                else:
+                    reference_fields = {}
+                if index == 0 and quote_target and not supports_reference:
+                    self.ctx.logger.debug(
+                        "Markdown 消息不携带 message_reference 以避免客户端重复渲染: target=%s", quote_target
+                    )
+                elif index == 0 and quote_target and not reference_fields:
+                    self.ctx.logger.debug(
+                        "QQ 官方出站缺少引用索引，消息不携带 message_reference: target=%s", quote_target
+                    )
                 passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
-                result = await self._api_post(f"{base_path}/messages", {**body, **passive_fields})
+                result = await self._api_post(
+                    f"{base_path}/messages", {**body, **reference_fields, **passive_fields}
+                )
                 if not result.get("id"):
                     raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
+                self._store_send_ref_idx(result)
+                if reference_fields:
+                    self.ctx.logger.info(
+                        "QQ 官方消息已携带引用: message_reference=%s",
+                        reference_fields["message_reference"]["message_id"],
+                    )
                 sent_ids.append(str(result["id"]))
             return {"success": True, "external_message_id": sent_ids[0]}
         except Exception as exc:
@@ -1137,6 +1184,53 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 exc = RuntimeError(f"已发送 {len(sent_ids)} 条后失败: {exc}")
             self.ctx.logger.warning("QQ 官方消息发送失败: %s", exc)
             return {"success": False, "error": str(exc)}
+
+    def _store_ref_idx(self, message_id: str, ref_idx: str, received_at: Optional[float] = None) -> None:
+        """保存平台消息 id 与官方引用索引（REFIDX）的映射，单事件循环内同步调用。"""
+        message_id = str(message_id or "").strip()
+        ref_idx = str(ref_idx or "").strip()
+        if not message_id or not ref_idx:
+            return
+        now = time.time()
+        stored_at = received_at if received_at is not None else now
+        if self._ref_idx:
+            self._ref_idx = {
+                mid: item for mid, item in self._ref_idx.items() if now - item[0] < REF_IDX_TTL_SEC
+            }
+        self._ref_idx[message_id] = (stored_at, ref_idx)
+        overflow = len(self._ref_idx) - MAX_REF_IDX_ENTRIES
+        if overflow > 0:
+            for old_id in sorted(self._ref_idx, key=lambda mid: self._ref_idx[mid][0])[:overflow]:
+                self._ref_idx.pop(old_id, None)
+
+    def _lookup_ref_idx(self, message_id: str) -> str:
+        """按平台消息 id 查官方引用索引；过期或不存在时返回空串（调用方按无引用降级）。"""
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return ""
+        item = self._ref_idx.get(message_id)
+        if item is None:
+            return ""
+        stored_at, ref_idx = item
+        if time.time() - stored_at >= REF_IDX_TTL_SEC:
+            self._ref_idx.pop(message_id, None)
+            return ""
+        return ref_idx
+
+    def _build_message_reference(self, target_message_id: str) -> Dict[str, Any]:
+        """把被回复消息 id 转成官方 message_reference；没有可用 REFIDX 时返回空字典。"""
+        ref_idx = self._lookup_ref_idx(str(target_message_id or "").strip())
+        if not ref_idx:
+            return {}
+        return {"message_reference": {"message_id": ref_idx}}
+
+    def _store_send_ref_idx(self, result: Mapping[str, Any]) -> None:
+        """保存自发消息回执 ext_info.ref_idx，使后续引用机器人消息也能渲染引用。"""
+        message_id = str(result.get("id") or "").strip()
+        ext_info = result.get("ext_info")
+        ref_idx = str(ext_info.get("ref_idx") or "").strip() if isinstance(ext_info, Mapping) else ""
+        if message_id and ref_idx:
+            self._store_ref_idx(message_id, ref_idx)
 
     async def _claim_passive_fields(self, scene: str, route_target: str, reply_to: str) -> Dict[str, Any]:
         """为一次发送占用被动回复序号；无入站上下文或被动窗口已失效时返回空字典。
