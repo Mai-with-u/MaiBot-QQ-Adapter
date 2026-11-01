@@ -85,3 +85,49 @@ async def test_gateway_markdown_mention_omits_message_reference() -> None:
     assert "qqbot-at-user" in payload["markdown"]["content"]
     assert "message_reference" not in payload
     assert payload.get("msg_id") == REPLY_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scene", ["group", "private"])
+@pytest.mark.parametrize("self_anchor", [False, True])
+async def test_conversation_anchor_does_not_request_visible_quote(scene, self_anchor):
+    plugin, captured = await _make_plugin()
+    plugin._replies = {(scene, GROUP_OPENID, REPLY_ID): (time.time(), 0)}
+    anchor = "previous-bot-card" if self_anchor else REPLY_ID
+    if self_anchor:
+        plugin._store_ref_idx(anchor, "REFIDX_previous_card==")
+    message = {
+        "message_info": {
+            "group_info": {"group_id": GROUP_OPENID} if scene == "group" else None,
+            "additional_config": {"platform_io_target_user_id": GROUP_OPENID},
+        },
+        "reply_to": anchor,
+        "raw_message": [{"type": "text", "data": "普通聊天，不请求引用"}],
+    }
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    payload = captured[0][1]
+    assert "message_reference" not in payload
+    if not self_anchor:
+        assert payload["msg_id"] == REPLY_ID
+        assert payload["msg_seq"] == 1
+    else:
+        assert "msg_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_explicit_quote_target_is_independent_of_passive_reply_anchor():
+    plugin, captured = await _make_plugin()
+    plugin._store_ref_idx("earlier-message", "REFIDX_earlier==")
+    message = {
+        "message_info": {"group_info": {"group_id": GROUP_OPENID}, "additional_config": {}},
+        "reply_to": REPLY_ID,
+        "raw_message": [
+            {"type": "reply", "data": {"target_message_id": "earlier-message"}},
+            {"type": "text", "data": "明确引用另一条消息"},
+        ],
+    }
+    assert (await plugin.handle_qq_official_gateway(message))["success"] is True
+    payload = captured[0][1]
+    assert payload["message_reference"] == {"message_id": "REFIDX_earlier=="}
+    assert payload["msg_id"] == REPLY_ID

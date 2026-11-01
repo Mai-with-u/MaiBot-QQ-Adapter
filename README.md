@@ -53,6 +53,7 @@ reconnect_delay_sec = 5.0
 
 - 文本、@（含 @ 时以 markdown 发送以渲染真实 @）、图片与表情（jpg/png/gif/webp/bmp）。
 - 官方一条消息只能承载一种内容，混合消息按原顺序拆成多条发送；每条各占一个被动回复序号（群聊每条入站消息最多被动回复 5 次）。
+- QQ 引用框只由明确的 `reply` 消息段触发；消息级 `reply_to` 只作为回复锚点与被动回复凭证，不自动显示引用框。
 - 图片/表情走官方分片上传（`upload_prepare` → 分片 PUT → `upload_part_finish` → `files` 合并）取得 `file_info`，再以 `msg_type=7` 发送。
 - 语音、文件出站暂不支持，会直接返回发送失败。
 

@@ -60,6 +60,7 @@ def test_invalid_or_routing_payloads_are_rejected(payload):
         encode_message(message(payload))
 
 
+@pytest.mark.asyncio
 async def test_gateway_uses_existing_passive_reply_accounting():
     plugin = QQOfficialAdapterPlugin.__new__(QQOfficialAdapterPlugin)
     plugin._ready = True
@@ -75,3 +76,23 @@ async def test_gateway_uses_existing_passive_reply_accounting():
     assert path == "/v2/users/mapped-user/messages"
     assert body["msg_type"] == 3 and body["ark"] == card()
     assert body["msg_id"] == "incoming" and body["msg_seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ark_does_not_quote_implicit_anchor():
+    plugin = QQOfficialAdapterPlugin.__new__(QQOfficialAdapterPlugin)
+    plugin._ready = True
+    plugin._id_map = {"user": {}, "group": {}}
+    plugin._ref_idx = {}
+    plugin._replies = {("private", "mapped-user", "incoming"): (time.time(), 0)}
+    plugin._reply_lock = asyncio.Lock()
+    plugin._ctx = SimpleNamespace(logger=Mock())
+    plugin._store_ref_idx("incoming", "REFIDX_incoming==")
+    plugin._api_post = AsyncMock(return_value={"id": "qq-card-id"})
+    msg = message(card())
+    msg["reply_to"] = "incoming"
+    assert (await plugin.handle_qq_official_gateway(msg))["success"] is True
+    payload = plugin._api_post.call_args.args[1]
+    assert payload["msg_type"] == 3
+    assert "message_reference" not in payload
+    assert payload["msg_id"] == "incoming" and payload["msg_seq"] == 1

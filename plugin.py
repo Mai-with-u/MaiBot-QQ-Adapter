@@ -1149,8 +1149,10 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             # 被动回复窗口按入站记录的统一 ID 匹配（encode 返回的 target 已反查为 OpenID）。
             route_target = self._id_map.get("group" if scene == "group" else "user", {}).get(target, target)
             reply_to = str(message.get("reply_to") or "").strip()
-            # reply 段是宿主明确指定的引用目标；没有段时回退到消息级 reply_to。
-            quote_target = reply_target_id or reply_to
+            # Only a reply segment requests a visible quote. Host-level reply_to
+            # is also populated for unquoted conversational anchors; keep it
+            # for passive reply accounting without turning it into a quote.
+            quote_target = reply_target_id
             base_path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}"
             # 官方一条消息只承载一种内容，文本与图片按原顺序逐条发送。
             for index, part in enumerate(parts):
