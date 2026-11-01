@@ -42,12 +42,41 @@ allowed_groups = []
 reconnect_delay_sec = 5.0
 ```
 
+## 入站语音
+
+- QQ 附件提供非空 `asr_refer_text` 时，直接作为 `[语音: 转写文字]` 文本段交给 MaiBot，不依赖音频下载或额外 STT 模型；保留同条消息中的正文和其他附件。
+- 未提供转写时，继续尝试获取音频；语音段的已识别内容保持为空，让 Host 按 `voice.enable_asr` 和 `model_task_config.voice` 配置执行识别。占位文字不视为已识别结果。
+- 没有平台转写且音频下载失败时，保留原来的文件降级行为；本地补丁没有放宽媒体域名、HTTPS、端口或重定向校验。
+- 本地补丁与验证说明见 `docs/qq-platform-asr-20261031.md`。升级插件后需确认这些修复是否已被上游包含。
+
 ## 出站消息
 
 - 文本、@（含 @ 时以 markdown 发送以渲染真实 @）、图片与表情（jpg/png/gif/webp/bmp）。
 - 官方一条消息只能承载一种内容，混合消息按原顺序拆成多条发送；每条各占一个被动回复序号（群聊每条入站消息最多被动回复 5 次）。
+- QQ 引用框只由明确的 `reply` 消息段触发；消息级 `reply_to` 只作为回复锚点与被动回复凭证，不自动显示引用框。
 - 图片/表情走官方分片上传（`upload_prepare` → 分片 PUT → `upload_part_finish` → `files` 合并）取得 `file_info`，再以 `msg_type=7` 发送。
 - 语音、文件出站暂不支持，会直接返回发送失败。
+
+### Ark 卡片
+
+插件可通过 SDK 的 `send.custom` 发送 QQ 官方 Ark 模板卡片，无需更改 MaiBot：
+
+```python
+result = await self.ctx.send.custom("qq_ark", {
+    "template_id": 37,
+    "kv": [
+        {"key": "#PROMPT#", "value": "视频分享"},
+        {"key": "#METATITLE#", "value": "视频标题"},
+        {"key": "#METASUBTITLE#", "value": "作者 / 分享说明"},
+        {"key": "#METACOVER#", "value": "https://example.com/cover.jpg"},
+        {"key": "#METAURL#", "value": "https://example.com/video"},
+    ],
+}, stream_id, return_details=True, processed_plain_text="视频标题与来源")
+```
+
+调用方需声明 `send.custom` 能力。支持 SDK 的 `dict` 包装和直接的 `qq_ark` 消息段；校验 `template_id`、字符串 kv 和一层 `obj/obj_kv`，拒绝夹带路由或其他 OpenAPI 字段。卡片独立发送，沿用现有账号映射、被动回复序号和发送回执。
+
+模板布局、权限、可用场景和 URL 配置以 [腾讯 Ark 文档](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/ark.md) 为准；[37 大图模板](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/template/template_37.md) 提供标题、子标题、封面与跳转链接。它不等同于 B站等第三方应用的原生分享卡片，也不保证聊天内直接播放。发送失败时不自动改发文本，调用方应核对实际结果后再决定后续操作。
 
 ## 扫码登录
 
@@ -79,6 +108,10 @@ QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 Q
 - `min_duration`/`max_duration`：时长限制（秒），官方上限 30 天，接口限频 60 QPM
 
 平台限制：只能禁言普通成员（群主、管理员、机器人不可被禁言）；目标用户需能解析出 OpenID——其消息经本适配器接收时自动携带，否则需先 `/assign_id` 绑定。
+
+## Ark 发送回执
+
+Ark 卡片发送提供可选的匹配回执查询 API，以及保留默认行为的单聊回复凭证兼容选项，详见 [Ark 回执与单聊回复凭证](docs/ark-delivery.md)。
 
 ## 撤回工具
 

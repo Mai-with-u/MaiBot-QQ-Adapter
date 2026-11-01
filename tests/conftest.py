@@ -22,3 +22,11 @@ if _PACKAGE not in sys.modules:
     package = types.ModuleType(_PACKAGE)
     package.__path__ = [str(_ROOT)]
     sys.modules[_PACKAGE] = package
+
+# Older tests use the deployment import path; keep standalone runs equivalent.
+if "plugins" not in sys.modules:
+    plugins = types.ModuleType("plugins")
+    plugins.__path__ = []
+    sys.modules["plugins"] = plugins
+sys.modules.setdefault("plugins.qq_official_adapter", sys.modules[_PACKAGE])
+setattr(sys.modules["plugins"], "qq_official_adapter", sys.modules["plugins.qq_official_adapter"])
