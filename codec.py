@@ -375,6 +375,7 @@ def encode_message(
       （msg_type=2）发送，否则为纯文本（msg_type=0）；
     - 每个图片/表情段单独成为一个 ``{"kind": "media", "binary": bytes, "file_name": str}``，
       由插件上传后以富媒体（msg_type=7）发送。
+    - ``qq_ark`` 自定义段校验后单独以 Ark（msg_type=3）发送。
 
     返回的第四项为 reply 段指向的被回复消息 ID（平台消息 id，非 REFIDX），
     由调用方转换为官方 message_reference；无 reply 段时为空串。
@@ -415,6 +416,15 @@ def encode_message(
     for segment in segments:
         if not isinstance(segment, Mapping):
             raise ValueError("出站消息段格式无效")
+        # send.custom stores unknown types as DictComponent({type, data}).
+        if segment.get("type") == "dict":
+            custom = segment.get("data")
+            if isinstance(custom, Mapping) and custom.get("type") == "qq_ark":
+                segment = custom
+        if segment.get("type") == "qq_ark":
+            _flush_text()
+            outbound.append({"kind": "body", "body": {"msg_type": 3, "ark": validate_ark(segment.get("data"))}})
+            continue
         if segment.get("type") == "reply":
             # reply 段不进入正文，但需把被回复消息 id 交给调用方，由其映射为
             # 官方 message_reference（REFIDX），否则 QQ 客户端不显示引用样式。
@@ -449,7 +459,7 @@ def encode_message(
             outbound.append({"kind": "media", **_decode_image_segment(segment)})
             continue
         if segment.get("type") != "text":
-            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片与表情")
+            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片、表情与 qq_ark")
         data = segment.get("data")
         if not isinstance(data, str):
             raise ValueError("出站文本段的数据必须是字符串")
@@ -458,6 +468,49 @@ def encode_message(
     if not outbound:
         raise ValueError("出站消息为空")
     return scene, target_id, outbound, reply_target_id
+
+
+def validate_ark(value: Any) -> Dict[str, Any]:
+    """Validate only the documented Ark payload, never arbitrary API/routing fields."""
+    if not isinstance(value, Mapping) or set(value) != {"template_id", "kv"}:
+        raise ValueError("qq_ark 数据须仅包含 template_id 和 kv")
+    template_id = value["template_id"]
+    if type(template_id) is not int or not 1 <= template_id <= 2**31 - 1:
+        raise ValueError("Ark template_id 须为正整数")
+
+    def text(item: Any, maximum: int) -> str:
+        if not isinstance(item, str) or len(item) > maximum:
+            raise ValueError("Ark 字段须为长度受限的字符串")
+        return item
+
+    def rows(items: Any, nested: bool = False) -> List[Dict[str, Any]]:
+        if not isinstance(items, list) or not 1 <= len(items) <= 50:
+            raise ValueError("Ark kv/obj_kv 须包含1..50项")
+        result = []
+        for row in items:
+            if not isinstance(row, Mapping) or not row.get("key"):
+                raise ValueError("Ark kv 项缺少 key")
+            item = {"key": text(row["key"], 128)}
+            if set(row) == {"key", "value"}:
+                item["value"] = text(row["value"], 4096)
+            elif not nested and set(row) == {"key", "obj"}:
+                if not isinstance(row["obj"], list) or not 1 <= len(row["obj"]) <= 50:
+                    raise ValueError("Ark obj 须包含1..50项")
+                objects = []
+                for obj in row["obj"]:
+                    if not isinstance(obj, Mapping) or set(obj) != {"obj_kv"}:
+                        raise ValueError("Ark obj 项须仅包含 obj_kv")
+                    objects.append({"obj_kv": rows(obj["obj_kv"], nested=True)})
+                item["obj"] = objects
+            else:
+                raise ValueError("Ark kv 项须包含 value 或一层 obj")
+            result.append(item)
+        return result
+
+    payload = {"template_id": template_id, "kv": rows(value["kv"])}
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 65536:
+        raise ValueError("Ark 数据超过64 KiB")
+    return payload
 
 
 def _decode_image_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:

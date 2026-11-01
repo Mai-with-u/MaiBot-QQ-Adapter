@@ -49,6 +49,27 @@ reconnect_delay_sec = 5.0
 - 图片/表情走官方分片上传（`upload_prepare` → 分片 PUT → `upload_part_finish` → `files` 合并）取得 `file_info`，再以 `msg_type=7` 发送。
 - 语音、文件出站暂不支持，会直接返回发送失败。
 
+### Ark 卡片
+
+插件可通过 SDK 的 `send.custom` 发送 QQ 官方 Ark 模板卡片，无需更改 MaiBot：
+
+```python
+result = await self.ctx.send.custom("qq_ark", {
+    "template_id": 37,
+    "kv": [
+        {"key": "#PROMPT#", "value": "视频分享"},
+        {"key": "#METATITLE#", "value": "视频标题"},
+        {"key": "#METASUBTITLE#", "value": "作者 / 分享说明"},
+        {"key": "#METACOVER#", "value": "https://example.com/cover.jpg"},
+        {"key": "#METAURL#", "value": "https://example.com/video"},
+    ],
+}, stream_id, return_details=True, processed_plain_text="视频标题与来源")
+```
+
+调用方需声明 `send.custom` 能力。支持 SDK 的 `dict` 包装和直接的 `qq_ark` 消息段；校验 `template_id`、字符串 kv 和一层 `obj/obj_kv`，拒绝夹带路由或其他 OpenAPI 字段。卡片独立发送，沿用现有账号映射、被动回复序号和发送回执。
+
+模板布局、权限、可用场景和 URL 配置以 [腾讯 Ark 文档](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/ark.md) 为准；[37 大图模板](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/template/template_37.md) 提供标题、子标题、封面与跳转链接。它不等同于 B站等第三方应用的原生分享卡片，也不保证聊天内直接播放。发送失败时不自动改发文本，调用方应核对实际结果后再决定后续操作。
+
 ## 扫码登录
 
 启用适配器后，在 WebUI「适配器管理 → QQ 官方机器人适配器」配置页点击「生成 / 刷新二维码」，使用手机 QQ 扫码并在官方页面完成机器人授权。成功后会将 AppID / AppSecret 原子保存到本插件的 `config.toml`，自动启用并连接；页面显示 AppID、机器人名称和实际连接状态，不显示 AppSecret。已有机器人凭据会被替换，请确认扫码授权的是目标机器人。
