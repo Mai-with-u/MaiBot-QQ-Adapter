@@ -25,6 +25,11 @@ class QQOfficialSettings(PluginConfigBase):
         json_schema_extra={"label": "AppSecret", "x-widget": "password"},
     )
     api_base_url: str = Field(default="https://api.bot.qq.com", description="QQ 开放平台 API 地址")
+    ark_private_use_passive_reply: bool = Field(
+        default=True,
+        description="单聊 Ark 卡片携带被动回复凭证。仅在携带凭证报 40034126、去掉后成功时关闭；关闭后仍受 QQ 主动发送策略限制，不会自动重试。",
+        json_schema_extra={"label": "单聊 Ark 使用被动回复凭证"},
+    )
     unified_account_id: str = Field(
         default="",
         description="统一账号 ID（如 NapCat 机器人 QQ 号）；非空时聊天流按此 ID 归属，与其它 qq 适配器共享上下文",

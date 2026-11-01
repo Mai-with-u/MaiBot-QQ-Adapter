@@ -109,6 +109,10 @@ QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 Q
 
 平台限制：只能禁言普通成员（群主、管理员、机器人不可被禁言）；目标用户需能解析出 OpenID——其消息经本适配器接收时自动携带，否则需先 `/assign_id` 绑定。
 
+## Ark 发送回执
+
+Ark 卡片发送提供可选的匹配回执查询 API，以及保留默认行为的单聊回复凭证兼容选项，详见 [Ark 回执与单聊回复凭证](docs/ark-delivery.md)。
+
 ## 撤回工具
 
 提供 `recall_message` LLM 工具（参数：`msg_id`；所在群/单聊从该消息解析，调用官方 `DELETE /v2/groups/{group_openid}/messages/{message_id}` 或 `DELETE /v2/users/{user_openid}/messages/{message_id}` 接口）。由配置 `[recall].enabled` 开关（默认开启）；`allowed_groups` 限制可撤回的群（统一群号或 group_openid），留空不限制。

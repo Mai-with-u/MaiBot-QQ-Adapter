@@ -28,6 +28,7 @@ from .codec import (
     extract_command_text,
     extract_message_scene_fields,
     summarize_payload,
+    validate_ark,
 )
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
@@ -46,6 +47,18 @@ MD5_10M_BYTES = 10002432
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
 TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
+
+
+class QQAPIError(RuntimeError):
+    """An explicit HTTP rejection, distinct from a transport timeout."""
+    def __init__(self, status: int, code: Any, message: str, endpoint: str):
+        self.status, self.code = status, code
+        super().__init__(f'QQ 接口 {endpoint} 失败: HTTP {status} code={code} message={message}')
+
+
+def ark_receipt_key(scene: str, target: str, ark: Mapping[str, Any]) -> str:
+    digest = sha256(json.dumps(validate_ark(ark), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    return f'{scene}:{target}:{digest}'
 ASSIGN_GROUP_COMMAND = "/assign_group_id"
 ASSIGN_USER_COMMAND = "/assign_id"
 MUTE_TOOL_NAME = "mute"
@@ -112,6 +125,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._account_id = ""
         self._bot_name = ""
         self._ready = False
+        self._ark_deliveries: Dict[str, Dict[str, Any]] = {}
         self._resuming = False
         self._heartbeat_ack = True
         self._replies: Dict[Tuple[str, str, str], Tuple[float, int]] = {}
@@ -1177,12 +1191,29 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     self.ctx.logger.debug(
                         "QQ 官方出站缺少引用索引，消息不携带 message_reference: target=%s", quote_target
                     )
-                passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
-                result = await self._api_post(
-                    f"{base_path}/messages", {**body, **reference_fields, **passive_fields}
-                )
+                official_cfg = getattr(getattr(self, 'config', None), 'qq_official', None)
+                ark_without_anchor = (scene == 'private' and body.get('msg_type') == 3
+                    and not getattr(official_cfg, 'ark_private_use_passive_reply', True))
+                passive_fields = {} if ark_without_anchor else await self._claim_passive_fields(scene, route_target, reply_to)
+                receipt_key = ark_receipt_key(scene, route_target, body['ark']) if body.get('msg_type') == 3 else ''
+                try:
+                    result = await self._api_post(
+                        f"{base_path}/messages", {**body, **reference_fields, **passive_fields}
+                    )
+                except Exception as exc:
+                    if receipt_key:
+                        definite = isinstance(exc, QQAPIError) and 400 <= exc.status < 500
+                        self._remember_ark_delivery(receipt_key, {'state': 'failed' if definite else 'unknown',
+                            'sent': False, 'error': str(exc)[:400], 'error_code': exc.code if isinstance(exc, QQAPIError) else None,
+                            'passive_reply': bool(passive_fields)})
+                    raise
                 if not result.get("id"):
+                    if receipt_key:
+                        self._remember_ark_delivery(receipt_key, {'state': 'unknown', 'sent': False, 'error': 'QQ 响应缺少消息 ID'})
                     raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
+                if receipt_key:
+                    self._remember_ark_delivery(receipt_key, {'state': 'sent', 'sent': True, 'message_id': str(result['id']),
+                        'passive_reply': bool(passive_fields)})
                 self._store_send_ref_idx(result)
                 if reference_fields:
                     self.ctx.logger.info(
@@ -1196,6 +1227,27 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 exc = RuntimeError(f"已发送 {len(sent_ids)} 条后失败: {exc}")
             self.ctx.logger.warning("QQ 官方消息发送失败: %s", exc)
             return {"success": False, "error": str(exc)}
+
+    def _remember_ark_delivery(self, key: str, result: Dict[str, Any]) -> None:
+        if not hasattr(self, '_ark_deliveries'):
+            self._ark_deliveries = {}
+        self._ark_deliveries[key] = {**result, 'observed_at': time.time()}
+        while len(self._ark_deliveries) > 128:
+            del self._ark_deliveries[min(self._ark_deliveries, key=lambda k: self._ark_deliveries[k]['observed_at'])]
+
+    @API('ark_delivery_status', version='1')
+    async def ark_delivery_status(self, target_id: str, ark: Dict[str, Any], after: float = 0, is_group: bool = False) -> Dict[str, Any]:
+        """Read one matching recent send receipt; never sends or retries a message.
+
+        Optional for other plugins whose Host send.custom result loses the
+        gateway rejection reason. Missing/old receipts remain unknown.
+        """
+        scene = 'group' if is_group else 'private'
+        target_id = str(self._id_map.get('group' if is_group else 'user', {}).get(target_id, target_id))
+        result = self._ark_deliveries.get(ark_receipt_key(scene, target_id, ark))
+        if not result or result['observed_at'] < after:
+            return {'state': 'unknown', 'sent': False, 'error': '没有与本次发送匹配的回执'}
+        return dict(result)
 
     def _store_ref_idx(self, message_id: str, ref_idx: str, received_at: Optional[float] = None) -> None:
         """保存平台消息 id 与官方引用索引（REFIDX）的映射，单事件循环内同步调用。"""
@@ -1287,6 +1339,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     if isinstance(result, Mapping)
                     else text[:200]
                 )
+                if response.status >= 400 and isinstance(result, Mapping):
+                    raise QQAPIError(response.status, result.get('code'), str(result.get('message', ''))[:200], path.rsplit('/', 1)[-1])
                 raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
         return result
 
