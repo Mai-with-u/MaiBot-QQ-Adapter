@@ -42,6 +42,13 @@ allowed_groups = []
 reconnect_delay_sec = 5.0
 ```
 
+## 入站语音
+
+- QQ 附件提供非空 `asr_refer_text` 时，直接作为 `[语音: 转写文字]` 文本段交给 MaiBot，不依赖音频下载或额外 STT 模型；保留同条消息中的正文和其他附件。
+- 未提供转写时，继续尝试获取音频；语音段的已识别内容保持为空，让 Host 按 `voice.enable_asr` 和 `model_task_config.voice` 配置执行识别。占位文字不视为已识别结果。
+- 没有平台转写且音频下载失败时，保留原来的文件降级行为；本地补丁没有放宽媒体域名、HTTPS、端口或重定向校验。
+- 本地补丁与验证说明见 `docs/qq-platform-asr-20261031.md`。升级插件后需确认这些修复是否已被上游包含。
+
 ## 出站消息
 
 - 文本、@（含 @ 时以 markdown 发送以渲染真实 @）、图片与表情（jpg/png/gif/webp/bmp）。
