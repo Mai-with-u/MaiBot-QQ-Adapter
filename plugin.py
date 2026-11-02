@@ -31,6 +31,7 @@ from .codec import (
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
 from .references import ReferenceCache, Scope, parse_scene_indexes, reply_target
+from .reference_debug import probe, scene_fields
 
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
@@ -41,7 +42,7 @@ MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
 # 官方预上传要求的 md5_10m：文件前 10002432 字节的 MD5。
 MD5_10M_BYTES = 10002432
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
-TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn")
+TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
 ASSIGN_GROUP_COMMAND = "/assign_group_id"
 ASSIGN_USER_COMMAND = "/assign_id"
@@ -363,7 +364,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         await self._reply_to_command(event, data, f"已将{subject}的 ID 绑定为 {value}，后续消息按该 ID 归属")
 
     async def _reply_to_command(self, event: str, data: Mapping[str, Any], text: str) -> None:
-        """以被动回复回执管理命令结果（引用命令消息的 msg_id，不占主动消息额度）。"""
+        """以被动额度回执管理命令结果；有效 msg_idx 另外用于可视引用。"""
         if event in GROUP_EVENTS:
             openid = str(data.get("group_openid") or "").strip()
             path = f"/v2/groups/{quote(openid, safe='')}/messages"
@@ -377,10 +378,17 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         try:
             session = self._require_session()
             token = await self._authorize()
+            payload: Dict[str, Any] = {
+                "content": text, "msg_type": 0, "msg_id": str(data.get("id") or ""), "msg_seq": 1,
+            }
+            # 使用当前命令自身索引，不是它引用的 ref_msg_idx；缺失时保留普通回执。
+            command_index, _ = parse_scene_indexes(data)
+            if command_index:
+                payload["message_reference"] = {"message_id": command_index}
             async with session.post(
                 self._api_url(path),
                 headers={"Authorization": f"QQBot {token}"},
-                json={"content": text, "msg_type": 0, "msg_id": str(data.get("id") or ""), "msg_seq": 1},
+                json=payload,
             ) as response:
                 if response.status >= 400:
                     self.ctx.logger.warning("QQ 管理命令回执失败: HTTP %s", response.status)
@@ -667,12 +675,23 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     target_id = self._references.id_for(self._reference_scope(event, data, account_id), reference)
                     if target_id and target_id != message_id:
                         message["raw_message"].insert(0, {"type": "reply", "data": {"target_message_id": target_id}})
+                    if probe.active():
+                        index, _ = parse_scene_indexes(data)
+                        scope = self._reference_scope(event, data, account_id)
+                        probe.emit(
+                            self.ctx, "adapter.route", message, target=target_id,
+                            **scene_fields(data), current_index=bool(index), ref_index=bool(reference),
+                            cache_hit=bool(target_id), self_target=target_id == message_id,
+                            # id_for already pruned; observe quarantine without changing cache state.
+                            quarantined=(scope, "") in self._references._forward,
+                        )
                     accepted = await self.ctx.gateway.route_message(
                         gateway_name=GATEWAY_NAME,
                         message=message,
                         external_message_id=message_id,
                         dedupe_key=message_id,
                     )
+                    probe.emit(self.ctx, "adapter.routed", message, accepted=bool(accepted))
                     break
         except BaseException:
             if inserted:
