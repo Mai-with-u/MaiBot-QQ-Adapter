@@ -31,7 +31,6 @@ from .codec import (
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
 from .references import ReferenceCache, Scope, parse_scene_indexes, reply_target
-from .reference_debug import probe, scene_fields
 
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
@@ -675,23 +674,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     target_id = self._references.id_for(self._reference_scope(event, data, account_id), reference)
                     if target_id and target_id != message_id:
                         message["raw_message"].insert(0, {"type": "reply", "data": {"target_message_id": target_id}})
-                    if probe.active():
-                        index, _ = parse_scene_indexes(data)
-                        scope = self._reference_scope(event, data, account_id)
-                        probe.emit(
-                            self.ctx, "adapter.route", message, target=target_id,
-                            **scene_fields(data), current_index=bool(index), ref_index=bool(reference),
-                            cache_hit=bool(target_id), self_target=target_id == message_id,
-                            # id_for already pruned; observe quarantine without changing cache state.
-                            quarantined=(scope, "") in self._references._forward,
-                        )
                     accepted = await self.ctx.gateway.route_message(
                         gateway_name=GATEWAY_NAME,
                         message=message,
                         external_message_id=message_id,
                         dedupe_key=message_id,
                     )
-                    probe.emit(self.ctx, "adapter.routed", message, accepted=bool(accepted))
                     break
         except BaseException:
             if inserted:
