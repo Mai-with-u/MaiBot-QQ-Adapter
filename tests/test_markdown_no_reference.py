@@ -1,45 +1,32 @@
-import asyncio
+from types import SimpleNamespace
+from typing import Any, Dict, List, Mapping, Tuple
+from unittest.mock import Mock
+
 import time
 
 import pytest
 
-from qq_official_adapter.plugin import QQOfficialAdapterPlugin
+from plugins.qq_official_adapter.plugin import QQOfficialAdapterPlugin
 
 GROUP_OPENID = "group-openid"
 REPLY_ID = "ROBOT1.0_reply"
 REFIDX = "REFIDX_reply=="
 
 
-class _Logger:
-    def debug(self, *args, **kwargs):
-        pass
-
-    def info(self, *args, **kwargs):
-        pass
-
-    def warning(self, *args, **kwargs):
-        pass
-
-
-class _Ctx:
-    logger = _Logger()
-
-
-async def _make_plugin():
-    """构造绕过 SDK 初始化的插件，捕获 _api_post 出站 payload。"""
-    plugin = QQOfficialAdapterPlugin.__new__(QQOfficialAdapterPlugin)
+async def _make_plugin() -> Tuple[QQOfficialAdapterPlugin, List[Tuple[str, Dict[str, Any]]]]:
+    """沿用上游正文/Markdown回归，使用真实初始化及作用域缓存。"""
+    plugin = QQOfficialAdapterPlugin()
+    plugin.set_plugin_config(plugin.get_default_config())
     plugin._ready = True
+    plugin._account_id = "test-bot"
     plugin._id_map = {"group": {}, "user": {}}
-    plugin._ref_idx = {}
-    plugin._replies = {}
-    plugin._reply_lock = asyncio.Lock()
-    plugin._ctx = _Ctx()
+    plugin._set_context(SimpleNamespace(logger=Mock()))
     # 模拟刚收到 REPLY_ID（被动窗口凭证 + 可用 REFIDX）。
     plugin._replies[("group", GROUP_OPENID, REPLY_ID)] = (time.time(), 0)
-    plugin._store_ref_idx(REPLY_ID, REFIDX)
-    captured = []
+    plugin._references.remember(("test-bot", "group", GROUP_OPENID), REPLY_ID, REFIDX)
+    captured: List[Tuple[str, Dict[str, Any]]] = []
 
-    async def _fake_api_post(path, payload):
+    async def _fake_api_post(path: str, payload: Mapping[str, Any], **kwargs: Any) -> Dict[str, Any]:
         captured.append((path, dict(payload)))
         return {"id": "ROBOT1.0_out", "ext_info": {"ref_idx": "REFIDX_out=="}}
 
@@ -54,7 +41,7 @@ async def test_gateway_text_keeps_message_reference() -> None:
     message = {
         "message_info": {"group_info": {"group_id": GROUP_OPENID}, "additional_config": {}},
         "raw_message": [
-            {"type": "reply", "data": REPLY_ID},
+            {"type": "reply", "data": {"target_message_id": REPLY_ID}},
             {"type": "text", "data": "你好"},
         ],
     }
@@ -73,7 +60,7 @@ async def test_gateway_markdown_mention_omits_message_reference() -> None:
     message = {
         "message_info": {"group_info": {"group_id": GROUP_OPENID}, "additional_config": {}},
         "raw_message": [
-            {"type": "reply", "data": REPLY_ID},
+            {"type": "reply", "data": {"target_message_id": REPLY_ID}},
             {"type": "at", "data": {"target_user_id": "user-openid"}},
             {"type": "text", "data": "看一下"},
         ],
