@@ -31,6 +31,7 @@ from .codec import (
 )
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
+from .quoted_media import quoted_image_attachments
 
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
@@ -662,12 +663,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 self._replies.pop(key, None)
 
     async def _build_attachments(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, include_quoted: bool = True
     ) -> Tuple[List[Dict[str, Any]], List[str], bool, bool]:
         """下载并转换 QQ 附件；下载失败降级为文本标签，返回段、标签与图片/表情标志。"""
         attachments = payload.get("attachments")
-        if not isinstance(attachments, list) or not attachments:
-            return [], [], False, False
+        if not isinstance(attachments, list):
+            attachments = []
         if len(attachments) > MAX_INBOUND_ATTACHMENTS:
             self.ctx.logger.warning(
                 "QQ 入站附件超过 %d 个限制，仅处理前 %d 个", MAX_INBOUND_ATTACHMENTS, MAX_INBOUND_ATTACHMENTS
@@ -732,6 +733,22 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             if url or filename:
                 segments.append({"type": "file", "data": self._file_payload(attachment, content_type, url)})
                 labels.append("[视频]" if content_type.startswith("video/") else f"[文件：{filename or '未命名'}]")
+        if include_quoted:
+            quoted = quoted_image_attachments(payload, MAX_INBOUND_ATTACHMENTS - len(attachments))
+            if quoted:
+                # Reuse all existing URL, redirect and size checks. Omit current
+                # content hints so a quoted image is not mistaken for a new emoji.
+                quote_segments, _, quote_picture, quote_emoji = await self._build_attachments(
+                    {"attachments": quoted}, include_quoted=False
+                )
+                segments.extend([
+                    {"type": "text", "data": "[以下图片来自引用消息]"},
+                    *quote_segments,
+                    {"type": "text", "data": "[引用图片结束]"},
+                ])
+                labels.append("[引用消息中的图片]")
+                is_picture = is_picture or quote_picture
+                is_emoji = is_emoji or quote_emoji
         return segments, labels, is_picture, is_emoji
 
     @staticmethod
