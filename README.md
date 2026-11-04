@@ -4,7 +4,7 @@
 
 ## 部署
 
-需要 MaiBot >= 1.3.18；禁言和撤回工具仅在 QQ 平台提供。
+需要 MaiBot >= 1.3.18；禁言、解除禁言和撤回工具仅在 QQ 平台提供。
 
 1. 在 [QQ 开放平台](https://q.qq.com/)完成开发者入驻并创建机器人，在控制台取得 **AppID** 与 **AppSecret（ClientSecret）**。在控制台为机器人开通群聊/单聊相关能力。QQ 的 OpenID 不是普通 QQ 号。
 2. 在 WebUI 的「QQ 官方机器人适配器 → QQ 开放平台」配置中填写 **AppID** 和 **AppSecret**。
@@ -36,6 +36,13 @@ allowed_groups = []
 enabled = true
 # 留空时允许所有群使用撤回工具，单聊不受群白名单限制。
 allowed_groups = []
+
+[group_admin]
+# 是否订阅群事件（成员入群/退群、加群申请等）。
+# 需要机器人在 QQ 开放平台具备对应事件权限；缺权限时自动降级为仅消息事件并重连。
+events_enabled = true
+# 是否把群事件以通知消息（is_notify）写入聊天流；关闭后仍可通过公开接口 adapter.group.events 取用。
+notify_events = true
 
 [advanced]
 # 断线重连间隔（秒）。
@@ -87,6 +94,61 @@ QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 Q
 未填写工具配置或 `allowed_groups` 时，工具默认启用且不限制群；已有配置中显式设置的 `enabled = false` 仍会关闭对应工具。
 
 平台限制：发送超过 2 分钟的消息不可撤回；群聊中机器人是群管理员时可撤回自己与普通群成员的消息，否则只能撤回自己发的消息；单聊只能撤回机器人自己发的消息。
+
+## 解除禁言工具
+
+提供 `unmute` LLM 工具（参数：`msg_id`；所在群与目标成员从该消息解析，调用官方 `POST /v2/groups/{group_openid}/restrict_chat_setting` 接口并设置 `op = "del"`，`mute_expire_at` 传空串表示立即解除）。由配置 `[mute].enabled` 开关（默认开启），并受 `[mute].allowed_groups` 群白名单约束；`admin_users` 保护名单对解除禁言不生效，因为该工具只放行不限制。
+
+平台限制与禁言工具一致：目标用户需能解析出 OpenID——其消息经本适配器接收时自动携带，否则需先 `/assign_id` 绑定。
+
+## 群聊管理接口
+
+提供 19 个公开接口（版本 `1`，`public = true`），供其它插件通过 `ctx.api.call` 调用，覆盖官方「群聊管理」全部接口。插件内部会把群号/QQ 号反查为 OpenID、按平台上限自动分片批量参数，并把平台错误码与 `trace_id` 原样包进错误信息。
+
+| 接口 | 说明 |
+| --- | --- |
+| `adapter.group.info` | 获取群基本信息（群名、简介、分类、标签、成员数） |
+| `adapter.group.bot_state` | 获取机器人群内状态（入群时间、是否接受主动推送、消息接收设置、机器人身份） |
+| `adapter.group.mute.get` | 查询群禁言状态（全局禁言规则与当前禁言中的成员） |
+| `adapter.group.mute.set` | 设置/更新群成员禁言（`members` 列表，单条 20 个自动分片） |
+| `adapter.group.mute.clear` | 解除群成员禁言（`op = "del"`） |
+| `adapter.group.members.list` | 获取群成员列表（`cursor` 分页，每次最多 30 条） |
+| `adapter.group.members.get` | 获取单个群成员信息 |
+| `adapter.group.members.remove` | 批量移除群成员（可同时加入群黑名单） |
+| `adapter.group.blacklist.list` | 查询群黑名单（`cursor`/`limit` 分页） |
+| `adapter.group.blacklist.set` | 群黑名单增删（`op = "add"` / `"del"`） |
+| `adapter.group.join_requests.list` | 拉取入群申请列表（`cursor`/`limit` 分页） |
+| `adapter.group.join_requests.approve` | 审批入群申请（`op = "approve"` / `"decline"`，建议回传 `join_request_id`） |
+| `adapter.group.strategy.create` | 创建入群自动审批策略 |
+| `adapter.group.strategy.list` | 拉取入群自动审批策略列表 |
+| `adapter.group.strategy.update` | 修改策略（开关、到期时间、关联群增删、备注） |
+| `adapter.group.strategy.delete` | 删除策略 |
+| `adapter.group.strategy.whitelist` | 维护策略白名单用户（`op = "add"` / `"del"`，自动分片） |
+| `adapter.group.strategy.execute` | 执行策略（异步全量扫描，约 10 分钟完成） |
+| `adapter.group.events` | 增量拉取群事件（`after_serial`、`limit`） |
+
+调用示例：
+
+```python
+result = await self.ctx.api.call("adapter.group.info", group_openid="123456789")
+if result["success"]:
+    group_name = result["data"]["group_name"]
+```
+
+`group_openid` 与 `member_openids` 支持统一 ID（群号/QQ 号）或原始 OpenID；统一 ID 需已通过 `/assign_group_id`、`/assign_id` 绑定。大多数群聊管理接口要求机器人为群管理员，平台会返回 `err_code = 11282`（检查管理员未通过）；未申请白名单权限的接口返回 `11253`。
+
+## 群事件
+
+在 `[group_admin].events_enabled` 开启时，适配器会在网关 Identify 中订阅以下事件（需要机器人具备对应事件权限）：
+
+- 成员维度（intent `1 << 24`）：`GROUP_MEMBER_ADD` 群成员加入、`GROUP_MEMBER_REMOVE` 群成员退出、`GROUP_JOIN_REQUEST` 加群申请（机器人为群管理员时才推送）
+- 机器人/群状态（intent `1 << 25`）：`GROUP_ADD_ROBOT` 机器人入群、`GROUP_DEL_ROBOT` 机器人退群、`GROUP_MSG_RECEIVE` 开启群消息接收、`GROUP_MSG_REJECT` 关闭群消息接收
+
+缺少事件权限时，网关会以关闭码 `4013/4014` 拒绝连接，适配器会自动降级为仅订阅消息事件并重连，日志中提示需在开放平台申请权限；重新启用插件后会再次尝试订阅。
+
+事件以环形缓冲（最近 200 条）保存，其它插件可通过 `adapter.group.events` 增量拉取：返回 `events`（含 `serial`、`event`、`label`、`summary`、`group_openid`、`member_openid` 等解析后字段与原始 `payload`）、`latest_serial`（下次传入 `after_serial`）与 `events_enabled`。
+
+`[group_admin].notify_events` 开启时，事件还会以 `is_notify` 通知消息写入聊天流，正文形如 `[事件-群成员加入] xxx 加入了群聊`，原始事件保存在 `additional_config.qq_official_notice_payload`，事件类型保存在 `additional_config.qq_official_notice_type`。通知消息不参与模型对话上下文。
 
 ## 头像接口
 

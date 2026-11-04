@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 - 2026-11-05
+
+### 主要功能
+
+- 群聊管理接口：新增 19 个公开接口（`adapter.group.*`），覆盖获取群基本信息、获取机器人群内状态、查询群禁言状态、设置/更新/解除群成员禁言、群成员列表与单个成员信息、批量移除群成员、群黑名单查询与增删、入群申请列表与审批、入群自动审批策略（创建/列表/修改/删除/白名单/执行）；其它插件可通过 `ctx.api.call("adapter.group.info", group_openid="...")` 直接调用，接口内部完成群号与成员统一 ID 反查、批量参数分片与错误包装。
+- 解除禁言工具：新增 `unmute` LLM 工具，调用 `restrict_chat_setting` 时使用 `op=del` 与空的 `mute_expire_at` 立即解除群成员禁言，解决群管无法解除禁言的问题（#5）。
+- 群事件订阅：接入 `GROUP_MEMBER_ADD`、`GROUP_MEMBER_REMOVE`、`GROUP_JOIN_REQUEST`（intent `1 << 24`）与 `GROUP_ADD_ROBOT`、`GROUP_DEL_ROBOT`、`GROUP_MSG_RECEIVE`、`GROUP_MSG_REJECT`（intent `1 << 25`）七个群事件；事件以环形缓冲保存并通过 `adapter.group.events` 增量拉取（`after_serial` + `limit`），同时可按配置转成 `is_notify` 通知消息写入聊天流。
+
+### 细节
+
+- 群事件需要在 QQ 开放平台申请对应事件权限：Identify 会携带 `1 << 24` 权限位，网关以 `4013/4014` 拒绝时自动降级为仅消息事件并重连，不会因为缺少群事件权限导致整个连接不可用；重新启用插件后会再次尝试订阅。
+- 新增配置栏 `[group_admin]`：`events_enabled` 控制是否订阅群事件，`notify_events` 控制是否把事件写进聊天流（关闭后仍可通过公开接口取用）。
+- 群管理接口复用 `[mute].enabled` 与 `[mute].allowed_groups`：`unmute` 工具随禁言工具一起启停，群白名单同样生效；解除禁言不检查 `[mute].admin_users` 保护名单，因为它只放行不限制。
+- 群聊管理的大部分接口需要机器人为群管理员，平台会返回 `err_code=11282`（检查管理员未通过）与 `11253`（无接口访问权限），插件会在错误信息里原样透出平台返回码与 `trace_id` 便于排查。
+
 ## 0.4.6 - 2026-10-27
 
 ### 修复
