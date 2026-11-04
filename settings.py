@@ -65,9 +65,20 @@ class RecallSettings(PluginConfigBase):
     )
 
 
+class FilterSettings(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "消息过滤"
+    __ui_order__: ClassVar[int] = 4
+
+    ignore_other_bots: bool = Field(
+        default=True,
+        description="忽略其它机器人发送的消息（官方事件的 author.bot=true，例如群里另一个官方机器人）",
+        json_schema_extra={"label": "屏蔽其他机器人消息"},
+    )
+
+
 class AdvancedSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "高级设置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
 
     reconnect_delay_sec: float = Field(
         default=5.0,
@@ -83,4 +94,5 @@ class AdapterSettings(PluginConfigBase):
     qq_official: QQOfficialSettings = Field(default_factory=QQOfficialSettings)
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
+    filter: FilterSettings = Field(default_factory=FilterSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)

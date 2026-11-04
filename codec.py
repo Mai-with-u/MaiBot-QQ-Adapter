@@ -168,6 +168,22 @@ def _extract_content(payload: Mapping[str, Any]) -> str:
     return "".join(parts).strip()
 
 
+def is_bot_author(payload: Mapping[str, Any]) -> bool:
+    """判断消息发送者是否为机器人。
+
+    官方事件体的 ``author`` 是 User 结构，``bot`` 布尔字段表示发送者本身是不是机器人
+    （群里的另一个官方机器人会给 true）。字段缺失或结构异常按普通用户处理。
+    """
+
+    author = payload.get("author")
+    if not isinstance(author, Mapping):
+        return False
+    value = author.get("bot")
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return value is True
+
+
 def extract_message_scene_fields(payload: Mapping[str, Any]) -> Tuple[str, str]:
     """解析 message_scene.ext，返回 (msg_idx, ref_msg_idx)。
 
