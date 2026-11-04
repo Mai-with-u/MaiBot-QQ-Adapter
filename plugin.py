@@ -50,6 +50,11 @@ ASSIGN_GROUP_COMMAND = "/assign_group_id"
 ASSIGN_USER_COMMAND = "/assign_id"
 MUTE_TOOL_NAME = "mute"
 RECALL_TOOL_NAME = "recall_message"
+AVATAR_TTL_SEC = 86400
+# 机器人资料随用户修改而变，头像 URL 短时缓存，避免每条消息都请求 /users/@me。
+BOT_PROFILE_TTL_SEC = 3600
+# OpenID 头像路由（实测最多返回 100×100，其他尺寸回落到 40×40）。
+OPENID_AVATAR_URL_TEMPLATE = "https://q.qlogo.cn/qqapp/{app_id}/{openid}/100"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -111,6 +116,10 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._seq: Optional[int] = None
         self._account_id = ""
         self._bot_name = ""
+        # 机器人自身头像来自 GET /users/@me（READY 载荷里的 user 不含头像），按账号短时缓存。
+        self._bot_avatar_url = ""
+        self._bot_profile_expires_at = 0.0
+        self._bot_profile_lock = asyncio.Lock()
         self._ready = False
         self._resuming = False
         self._heartbeat_ack = True
@@ -261,7 +270,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             raise ValueError("群或用户映射不存在")
         resource = await self.api_get_avatar(PLATFORM, openid, kind)
         if resource["status"] != "available":
-            return {"image": "", "message": "绑定 ID 不是数字，无法获取 QQ 头像"}
+            return {"image": "", "message": "该群或用户无法获取 QQ 头像"}
         url = resource["url"].replace("/640", "/100").replace("s=640", "s=100")
         async with ClientSession(timeout=ClientTimeout(total=10)) as session:
             async with session.get(url, allow_redirects=False) as response:
@@ -877,19 +886,69 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if not normalized_target_id:
             raise ValueError("target_id 必须非空")
 
-        # OpenID 不能用于 QQ 头像 URL；已绑定时使用对应的真实 QQ 号或群号。
-        normalized_target_id = self._id_map[target_type].get(normalized_target_id, normalized_target_id).strip()
-        if re.fullmatch(r"[0-9]+", normalized_target_id) is None:
+        # 统一 ID 已绑定时用真实 QQ 号/群号查询；未绑定时目标值本身就是 OpenID。
+        mapped_id = self._id_map[target_type].get(normalized_target_id, "").strip()
+        effective_id = mapped_id or normalized_target_id
+        # 机器人自身只有 OpenID（可能被统一账号映射成 QQ 号），头像统一走 /users/@me。
+        if target_type == "user" and self._is_bot_target(effective_id):
+            return await self._bot_avatar_resource()
+        if re.fullmatch(r"[0-9]+", effective_id) is not None:
+            normalized_id = int(effective_id)
+            if normalized_id <= 0:
+                raise ValueError("target_id 必须为正整数")
+            url = (
+                f"https://p.qlogo.cn/gh/{normalized_id}/{normalized_id}/640"
+                if target_type == "group"
+                else f"https://q1.qlogo.cn/g?b=qq&nk={normalized_id}&s=640"
+            )
+            return {"status": "available", "url": url, "expires_in": AVATAR_TTL_SEC}
+
+        # OpenID 头像：官方不提供按群 OpenID 取群头像的接口，只有用户维度可用。
+        if target_type == "group":
             return {"status": "unsupported"}
-        normalized_id = int(normalized_target_id)
-        if normalized_id <= 0:
-            raise ValueError("target_id 必须为正整数")
-        url = (
-            f"https://p.qlogo.cn/gh/{normalized_id}/{normalized_id}/640"
-            if target_type == "group"
-            else f"https://q1.qlogo.cn/g?b=qq&nk={normalized_id}&s=640"
-        )
-        return {"status": "available", "url": url, "expires_in": 86400}
+        url = self._openid_avatar_url(effective_id)
+        if not url:
+            return {"status": "unsupported"}
+        return {"status": "available", "url": url, "expires_in": AVATAR_TTL_SEC}
+
+    def _is_bot_target(self, target_id: str) -> bool:
+        """机器人自身的头像由 READY 上报的 ID 或统一账号标识，需与普通用户区分后走 /users/@me。"""
+        candidates = {self._account_id.strip(), self._unified_account_id.strip()} - {""}
+        return target_id.strip() in candidates
+
+    def _openid_avatar_url(self, openid: str) -> str:
+        """OpenID 头像走官方 q.qlogo.cn 路由；未配置 AppID 时拼不出该 URL。"""
+        app_id = self.config.qq_official.app_id.strip()
+        if not app_id or not openid:
+            return ""
+        return OPENID_AVATAR_URL_TEMPLATE.format(app_id=quote(app_id, safe=""), openid=quote(openid, safe=""))
+
+    async def _bot_avatar_resource(self) -> Dict[str, Any]:
+        """机器人头像只出现在 GET /users/@me 的 avatar 字段，READY 载荷里没有。"""
+        url = await self._fetch_bot_avatar_url()
+        if not url:
+            return {"status": "missing"}
+        return {"status": "available", "url": url, "expires_in": AVATAR_TTL_SEC}
+
+    async def _fetch_bot_avatar_url(self, *, force: bool = False) -> str:
+        """按短 TTL 缓存机器人头像 URL；查询失败不影响头像以外的功能。"""
+        if not force and self._bot_avatar_url and time.time() < self._bot_profile_expires_at:
+            return self._bot_avatar_url
+        async with self._bot_profile_lock:
+            if not force and self._bot_avatar_url and time.time() < self._bot_profile_expires_at:
+                return self._bot_avatar_url
+            try:
+                profile = await self._api_get("/users/@me")
+            except Exception as exc:
+                self.ctx.logger.warning("QQ 机器人详情查询失败，本次不返回机器人头像: %s", exc)
+                return ""
+            avatar = str(profile.get("avatar") or "").strip()
+            if not avatar:
+                self.ctx.logger.warning("QQ 机器人详情缺少 avatar 字段")
+                return ""
+            self._bot_avatar_url = avatar
+            self._bot_profile_expires_at = time.time() + BOT_PROFILE_TTL_SEC
+            return avatar
 
     @Tool(
         MUTE_TOOL_NAME,
@@ -1254,6 +1313,28 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             sequence = used + 1
             self._replies[key] = (received_at, sequence)
             return {"msg_id": key[2], "msg_seq": sequence}
+
+    async def _api_get(self, path: str) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（GET），HTTP 错误时带上平台错误码与说明抛出。"""
+        session = self._require_session()
+        token = await self._authorize()
+        async with session.get(
+            self._api_url(path),
+            headers={"Authorization": f"QQBot {token}"},
+        ) as response:
+            text = await response.text()
+            try:
+                result = json.loads(text) if text.strip() else {}
+            except ValueError:
+                result = None
+            if response.status >= 400 or not isinstance(result, Mapping):
+                detail = (
+                    f"code={result.get('code')} message={result.get('message')}"
+                    if isinstance(result, Mapping)
+                    else text[:200]
+                )
+                raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
+        return result
 
     async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""

@@ -59,7 +59,7 @@ reconnect_delay_sec = 5.0
 
 ## 查看及绑定 ID 映射
 
-WebUI 侧边栏「插件扩展 → QQ 群与用户映射」分别展示群 OpenID 对应的群号、用户 OpenID 对应的 QQ 号，以及头像、类型图标和绑定数量；执行绑定命令后点击刷新即可更新。页面为只读，无绑定时显示命令提示。头像按需加载，失败时显示原因；非数字绑定 ID 无法获取 QQ 头像。
+WebUI 侧边栏「插件扩展 → QQ 群与用户映射」分别展示群 OpenID 对应的群号、用户 OpenID 对应的 QQ 号，以及头像、类型图标和绑定数量；执行绑定命令后点击刷新即可更新。页面为只读，无绑定时显示命令提示。头像按需加载，失败时显示原因；用户 OpenID 直接取官方头像，群 OpenID 因官方未提供接口无法获取群头像。
 
 QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 QQ 号归属（与 NapCat 系适配器的数据统一），可在聊天内发送绑定命令：
 
@@ -94,7 +94,9 @@ QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 Q
 
 - 数字 QQ 号、群号返回头像 URL 和 `expires_in = 86400`，图片由宿主统一下载、缓存。
 - OpenID 已通过 `/assign_id` 或 `/assign_group_id` 绑定真实数字 ID 时，使用绑定值查询头像。
-- 未绑定的 OpenID、非数字绑定值及非 `qq` 平台返回 `status = "unsupported"`。
+- 未绑定的用户 OpenID 改用官方头像路由 `https://q.qlogo.cn/qqapp/{AppID}/{openid}/100` 取头像（需配置 `AppID`；该路由只提供 100×100 尺寸）。
+- 机器人自身头像取自 `GET /users/@me` 的 `avatar` 字段（`READY` 载荷不含头像），按 1 小时缓存，随机器人资料更新自动刷新。
+- 群 OpenID 无法取群头像（官方未提供该接口）、未配置 `AppID` 时的用户 OpenID，以及非 `qq` 平台返回 `status = "unsupported"`；`target_type` 非 `user`/`group` 或 `target_id` 为空时抛出 `ValueError`。
 
 ## 戳一戳
 
