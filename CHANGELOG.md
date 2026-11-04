@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.7 - 2026-11-04
+
+### 主要功能
+
+- 头像：`adapter.avatar.get` 支持未绑定 OpenID 的用户直接返回官方路由 `https://q.qlogo.cn/qqapp/{AppID}/{openid}/100` 头像 URL，WebUI 聊天页可直接显示 QQ 官方用户头像。
+- 头像：新增机器人自身头像，取自 `GET /users/@me` 的 `avatar` 字段并缓存 1 小时；此前 QQ 官方机器人没有 QQ 号，前端请求机器人头像只会拿到 `unsupported`。
+
+### 细节
+
+- 头像：新增 `_api_get` 复用官方 OpenAPI 的 `QQBot` Token 鉴权与错误包装。
+- 头像：群 OpenID 仍返回 `unsupported`（官方未提供按群 OpenID 取群头像的接口）；未配置 `AppID` 的用户 OpenID 同样返回 `unsupported`。
+- 映射页头像：不可用时的提示文案由「绑定 ID 不是数字」改为「该群或用户无法获取 QQ 头像」。
+
 ## 0.4.6 - 2026-10-27
 
 ### 修复
