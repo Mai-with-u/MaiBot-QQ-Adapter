@@ -65,9 +65,28 @@ class RecallSettings(PluginConfigBase):
     )
 
 
+class GroupAdminSettings(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "群聊管理"
+    __ui_order__: ClassVar[int] = 4
+
+    events_enabled: bool = Field(
+        default=True,
+        description=(
+            "订阅群事件（成员入群/退群、加群申请等）。需要机器人在 QQ 开放平台具备对应事件权限，"
+            "缺少权限时自动降级为仅消息事件并在日志中提示"
+        ),
+        json_schema_extra={"label": "订阅群事件"},
+    )
+    notify_events: bool = Field(
+        default=True,
+        description="把收到的群事件以通知消息写入聊天流（is_notify）；关闭后仍可通过公开接口 adapter.group.events 取用",
+        json_schema_extra={"label": "群事件写入聊天流"},
+    )
+
+
 class AdvancedSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "高级设置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
 
     reconnect_delay_sec: float = Field(
         default=5.0,
@@ -83,4 +102,5 @@ class AdapterSettings(PluginConfigBase):
     qq_official: QQOfficialSettings = Field(default_factory=QQOfficialSettings)
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
+    group_admin: GroupAdminSettings = Field(default_factory=GroupAdminSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)

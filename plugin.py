@@ -19,21 +19,32 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .codec import (
     GROUP_EVENTS,
+    GROUP_MEMBER_EVENT,
+    GROUP_NOTICE_EVENTS,
     PLATFORM,
     QQ_FACE_TAG_PATTERN,
     QQ_MENTION_TOKEN_PATTERN,
     SUPPORTED_EVENTS,
+    build_group_notice_message,
+    decode_group_event,
     decode_message,
     encode_message,
     extract_command_text,
     extract_message_scene_fields,
     summarize_payload,
 )
+from .group_admin import GroupAdminClient, GroupAdminMixin
 from .settings import AdapterSettings
 from .qr_login import QRLogin, save_credentials
 
 GATEWAY_NAME = "qq_official_gateway"
 MESSAGE_INTENTS = 1 << 25
+# 群事件订阅：机器人/群状态事件随消息意图下发，成员维度事件（成员入群/退群、加群申请）
+# 需要额外的 1 << 24 权限位；未申请权限时网关会拒绝整条订阅，因此单独记录降级状态。
+GROUP_EVENT_INTENTS = MESSAGE_INTENTS | GROUP_MEMBER_EVENT
+# 群事件环形缓冲：保留最近若干条供其它插件按序号增量拉取。
+MAX_GROUP_EVENTS = 200
+GROUP_EVENT_PAGE_LIMIT = 100
 REPLY_LIMITS = {"group": (300, 5), "private": (3600, 4)}
 # 官方引用索引（REFIDX）没有与被动回复一致的有效期，按 24 小时保留并限制条目数，防内存无限增长。
 REF_IDX_TTL_SEC = 24 * 3600
@@ -49,12 +60,13 @@ ID_MAP_FILE_NAME = "id_map.json"
 ASSIGN_GROUP_COMMAND = "/assign_group_id"
 ASSIGN_USER_COMMAND = "/assign_id"
 MUTE_TOOL_NAME = "mute"
+UNMUTE_TOOL_NAME = "unmute"
 RECALL_TOOL_NAME = "recall_message"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-class QQOfficialAdapterPlugin(MaiBotPlugin):
+class QQOfficialAdapterPlugin(GroupAdminMixin, MaiBotPlugin):
     """使用 QQ 开放平台的 WebSocket 事件和 OpenAPI 接入 MaiBot。"""
 
     config_model: ClassVar[Optional[Type[PluginConfigBase]]] = AdapterSettings
@@ -127,6 +139,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._qr_login = QRLogin(self._apply_qr_credentials)
         self._gateway_state_lock = asyncio.Lock()
         self._inbound_ready = asyncio.Event()
+        # 群聊管理：OpenAPI 客户端、群事件环形缓冲与订阅状态。
+        self._group_api = GroupAdminClient(self)
+        self._group_events: List[Dict[str, Any]] = []
+        self._group_event_serial = 0
+        self._group_events_active = False
+        self._group_events_denied = False
 
     async def on_load(self) -> None:
         # 页面在连接关闭或凭据尚未填写时也需要展示已有绑定。
@@ -179,6 +197,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         """按 [mute].enabled、[recall].enabled 同步可选 LLM 工具的启停状态。"""
         tool_states = (
             (MUTE_TOOL_NAME, "禁言", self.config.mute.enabled),
+            (UNMUTE_TOOL_NAME, "解除禁言", self.config.mute.enabled),
             (RECALL_TOOL_NAME, "撤回", self.config.recall.enabled),
         )
         for tool_name, label, enabled in tool_states:
@@ -203,6 +222,9 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             return
         self._unified_account_id = settings.unified_account_id.strip()
         self._assign_admin_ids = [str(item).strip() for item in settings.assign_admin_ids if str(item).strip()]
+        # 每次启动重新尝试群事件订阅：用户可能在开放平台补授权后重启插件。
+        self._group_events_denied = False
+        self._group_events_active = self.config.group_admin.events_enabled
         self._worker = asyncio.create_task(self._run(), name="qq-official-adapter")
 
     async def _stop(self) -> None:
@@ -224,6 +246,9 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         await self._disconnect()
         self._replies.clear()
         self._ref_idx.clear()
+        self._group_events.clear()
+        self._group_event_serial = 0
+        self._group_events_active = False
         self._session_id = ""
         self._seq = None
         self._account_id = ""
@@ -470,6 +495,19 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if code in {4914, 4915}:
             self.ctx.logger.error("QQ 官方网关不可恢复地断开: code=%s，请检查机器人上线状态及平台权限", code)
             return False
+        if code in {4013, 4014} and not self._group_events_denied and self.config.group_admin.events_enabled:
+            # 官方在订阅了无权限的 intent 时会直接关闭连接：降级为仅消息事件后重连，
+            # 避免群事件权限未申请时整个适配器不可用。重新启用插件即可重试订阅。
+            self._group_events_denied = True
+            self._group_events_active = False
+            self._reset_gateway_session()
+            self._invalidate_token()
+            self.ctx.logger.warning(
+                "QQ 网关拒绝群事件订阅（code=%s），已降级为仅消息事件；"
+                "请在 QQ 开放平台申请群成员事件权限后重新启用插件",
+                code,
+            )
+            return True
         if code == 4004:
             self._invalidate_token()
         elif code in {4006, 4007, 4009} or (code is not None and 4900 <= code <= 4913):
@@ -498,6 +536,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             # aiohttp 的迭代器可能直接结束而不产出 CLOSE 帧，需从连接读取最终关闭码。
             return ws.close_code
 
+    def _resolve_intents(self) -> int:
+        """按配置与权限探测结果决定订阅意图：群事件缺权限时只订阅消息事件。"""
+        if self._group_events_denied or not self.config.group_admin.events_enabled:
+            return MESSAGE_INTENTS
+        return GROUP_EVENT_INTENTS
+
     async def _handle_gateway_payload(self, payload: Mapping[str, Any]) -> None:
         op = payload.get("op")
         data = payload.get("d")
@@ -523,7 +567,11 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 await self._send_ws(
                     {
                         "op": 2,
-                        "d": {"token": f"QQBot {self._access_token}", "intents": MESSAGE_INTENTS, "shard": [0, 1]},
+                        "d": {
+                            "token": f"QQBot {self._access_token}",
+                            "intents": self._resolve_intents(),
+                            "shard": [0, 1],
+                        },
                     }
                 )
         elif op == 0:
@@ -562,6 +610,14 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                         )
                         self._dispatch_tasks.add(task)
                         task.add_done_callback(self._on_dispatch_done)
+            elif event in GROUP_NOTICE_EVENTS:
+                # 群事件与消息共用同一连接：成员维度事件需 1 << 24 权限，缺权限时不会推送。
+                if not self.config.group_admin.events_enabled:
+                    return
+                if isinstance(data, Mapping):
+                    await self._handle_group_event(event, data, str(payload.get("id") or ""))
+                else:
+                    self.ctx.logger.warning("QQ 群事件结构无效: %s", payload.get("id"))
         elif op == 1:
             await self._send_ws({"op": 1, "d": self._seq})
         elif op == 11:
@@ -578,6 +634,61 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._dispatch_tasks.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
             self.ctx.logger.error("QQ 官方消息路由失败", exc_info=(type(error), error, error.__traceback__))
+
+    async def _handle_group_event(self, event: str, data: Mapping[str, Any], event_id: str) -> None:
+        """记录群事件：写入环形缓冲供公开接口拉取，并按配置转成通知消息进聊天流。"""
+        try:
+            record = decode_group_event(event, data, event_id=event_id, id_map=self._id_map)
+        except ValueError as exc:
+            self.ctx.logger.info("忽略 QQ 群事件: %s | payload=%s", exc, summarize_payload(data))
+            return
+        self._group_event_serial += 1
+        record["serial"] = self._group_event_serial
+        self._group_events.append(record)
+        if len(self._group_events) > MAX_GROUP_EVENTS:
+            del self._group_events[: len(self._group_events) - MAX_GROUP_EVENTS]
+        self.ctx.logger.info("QQ 群事件: %s", record["summary"])
+        if not self.config.group_admin.notify_events:
+            return
+        if len(self._dispatch_tasks) >= MAX_PENDING_DISPATCHES:
+            self.ctx.logger.warning("QQ 官方消息处理队列已满，群事件未写入聊天流: %s", record["summary"])
+            return
+        notice = build_group_notice_message(record, self._account_id, unified_account_id=self._unified_account_id)
+        task = asyncio.create_task(self._route_group_notice(notice), name="qq-official-group-notice")
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._on_dispatch_done)
+
+    async def _route_group_notice(self, message: Dict[str, Any]) -> None:
+        """把群事件通知写入聊天流（is_notify）；与入站消息一致等待网关恢复后才投递。"""
+        message_id = str(message.get("message_id") or "")
+        while True:
+            await self._inbound_ready.wait()
+            async with self._gateway_state_lock:
+                if not self._ready:
+                    continue
+                accepted = await self.ctx.gateway.route_message(
+                    gateway_name=GATEWAY_NAME,
+                    message=message,
+                    external_message_id=message_id,
+                    dedupe_key=message_id,
+                )
+                break
+        if not accepted:
+            self.ctx.logger.warning("QQ 群事件通知未被聊天流接收: %s", message.get("processed_plain_text"))
+
+    def snapshot_group_events(self, after_serial: int = 0, limit: int = GROUP_EVENT_PAGE_LIMIT) -> List[Dict[str, Any]]:
+        """按序号增量返回群事件（由旧到新），供公开接口分页拉取。"""
+        try:
+            normalized_serial = int(after_serial or 0)
+        except (TypeError, ValueError):
+            normalized_serial = 0
+        try:
+            normalized_limit = int(limit or 0)
+        except (TypeError, ValueError):
+            normalized_limit = GROUP_EVENT_PAGE_LIMIT
+        normalized_limit = max(1, min(normalized_limit, GROUP_EVENT_PAGE_LIMIT))
+        events = [record for record in self._group_events if int(record.get("serial") or 0) > normalized_serial]
+        return [dict(record) for record in events[:normalized_limit]]
 
     async def _heartbeat(self, interval: float) -> None:
         try:
@@ -891,6 +1002,71 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         )
         return {"status": "available", "url": url, "expires_in": 86400}
 
+    async def _locate_mute_target(self, normalized_msg_id: str, stream_id: str, action: str) -> Dict[str, Any]:
+        """按消息 ID 解析禁言目标（群与成员）；解析失败时返回 ``{"error": ...}``。"""
+        # 通过消息 ID 定位发送者，复用宿主消息查询能力。
+        query_result = await self.ctx.message.get_by_id(
+            normalized_msg_id,
+            stream_id=stream_id,
+            include_binary_data=False,
+        )
+        message_info = query_result.get("message_info", {}) if isinstance(query_result, Mapping) else {}
+        user_info = message_info.get("user_info", {}) if isinstance(message_info, Mapping) else {}
+        additional_config = message_info.get("additional_config") if isinstance(message_info, Mapping) else None
+        target_user_id = str(user_info.get("user_id") or "").strip()
+        if not target_user_id:
+            return {"error": f"未找到消息 {normalized_msg_id} 或其缺少发送者信息"}
+        target_display_name = (
+            str(user_info.get("user_cardname") or "").strip()
+            or str(user_info.get("user_nickname") or "").strip()
+            or target_user_id
+        )
+
+        group_info = message_info.get("group_info") if isinstance(message_info, Mapping) else None
+        normalized_group_id = str(group_info.get("group_id") or "").strip() if isinstance(group_info, Mapping) else ""
+        if not normalized_group_id:
+            return {"error": f"{action}仅支持群聊，目标消息不属于群聊"}
+        group_openid = (
+            str(additional_config.get("qq_official_group_openid") or "").strip()
+            if isinstance(additional_config, Mapping)
+            else ""
+        ) or self._resolve_group_openid(normalized_group_id)
+        return {
+            "group_id": normalized_group_id,
+            "group_openid": group_openid,
+            "user_id": target_user_id,
+            "display_name": target_display_name,
+            "member_openid": self._resolve_member_openid(target_user_id, additional_config),
+        }
+
+    def _mute_group_allowed(self, normalized_group_id: str, group_openid: str) -> bool:
+        """禁言与解除禁言共用 [mute].allowed_groups 白名单（统一群号或 group_openid 命中即可）。"""
+        allowed_groups = [str(item).strip() for item in self.config.mute.allowed_groups if str(item).strip()]
+        return not allowed_groups or normalized_group_id in allowed_groups or group_openid in allowed_groups
+
+    async def _submit_mute_op(
+        self, group_openid: str, member_openid: str, op: str, expire_at: str, action: str
+    ) -> Optional[Dict[str, Any]]:
+        """提交一次 restrict_chat_setting 调用；成功返回 None，失败返回可直接回给模型的错误响应。"""
+        try:
+            session = self._require_session()
+            token = await self._authorize()
+            async with session.post(
+                self._api_url(f"/v2/groups/{quote(group_openid, safe='')}/restrict_chat_setting"),
+                headers={"Authorization": f"QQBot {token}"},
+                json={
+                    "members": [
+                        {"op": op, "member_openid": member_openid, "mute_expire_at": expire_at},
+                    ]
+                },
+            ) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    return {"success": False, "error": f"QQ {action}失败: HTTP {response.status} {body[:200]}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        return None
+
     @Tool(
         MUTE_TOOL_NAME,
         platforms=PLATFORM,
@@ -946,39 +1122,18 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             return {"success": False, "error": "禁言时长必须是正整数（秒）"}
         normalized_duration = max(mute_settings.min_duration, min(normalized_duration, mute_settings.max_duration))
 
-        # 通过消息 ID 定位发送者，复用宿主消息查询能力。
-        query_result = await self.ctx.message.get_by_id(
-            normalized_msg_id,
-            stream_id=stream_id,
-            include_binary_data=False,
-        )
-        message_info = query_result.get("message_info", {}) if isinstance(query_result, Mapping) else {}
-        user_info = message_info.get("user_info", {}) if isinstance(message_info, Mapping) else {}
-        additional_config = message_info.get("additional_config") if isinstance(message_info, Mapping) else None
-        target_user_id = str(user_info.get("user_id") or "").strip()
-        if not target_user_id:
-            return {"success": False, "error": f"未找到消息 {normalized_msg_id} 或其缺少发送者信息"}
-        target_display_name = (
-            str(user_info.get("user_cardname") or "").strip()
-            or str(user_info.get("user_nickname") or "").strip()
-            or target_user_id
-        )
-
-        group_info = message_info.get("group_info") if isinstance(message_info, Mapping) else None
-        normalized_group_id = str(group_info.get("group_id") or "").strip() if isinstance(group_info, Mapping) else ""
-        if not normalized_group_id:
-            return {"success": False, "error": "禁言仅支持群聊，目标消息不属于群聊"}
-        group_openid = (
-            str(additional_config.get("qq_official_group_openid") or "").strip()
-            if isinstance(additional_config, Mapping)
-            else ""
-        ) or self._resolve_group_openid(normalized_group_id)
-        allowed_groups = [str(item).strip() for item in mute_settings.allowed_groups if str(item).strip()]
-        if allowed_groups and normalized_group_id not in allowed_groups and group_openid not in allowed_groups:
+        target = await self._locate_mute_target(normalized_msg_id, stream_id, "禁言")
+        if error := target.get("error"):
+            return {"success": False, "error": error}
+        normalized_group_id = target["group_id"]
+        group_openid = target["group_openid"]
+        if not self._mute_group_allowed(normalized_group_id, group_openid):
             return {"success": False, "error": f"群 {normalized_group_id} 不在禁言白名单内"}
 
         # 保护名单：配置内用户一律不禁言（统一 QQ 号或 OpenID 均可命中）。
-        member_openid = self._resolve_member_openid(target_user_id, additional_config)
+        target_user_id = target["user_id"]
+        target_display_name = target["display_name"]
+        member_openid = target["member_openid"]
         admin_users = [str(item).strip() for item in mute_settings.admin_users if str(item).strip()]
         if target_user_id in admin_users or (member_openid and member_openid in admin_users):
             return {"success": False, "error": f"用户 {target_display_name} 在禁言保护名单中，无法被禁言"}
@@ -992,23 +1147,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         expire_at = (datetime.now(timezone.utc) + timedelta(seconds=normalized_duration)).isoformat().replace(
             "+00:00", "Z"
         )
-        try:
-            session = self._require_session()
-            token = await self._authorize()
-            async with session.post(
-                self._api_url(f"/v2/groups/{quote(group_openid, safe='')}/restrict_chat_setting"),
-                headers={"Authorization": f"QQBot {token}"},
-                json={
-                    "members": [
-                        {"op": "add", "member_openid": member_openid, "mute_expire_at": expire_at},
-                    ]
-                },
-            ) as response:
-                if response.status >= 400:
-                    body = await response.text()
-                    return {"success": False, "error": f"QQ 禁言失败: HTTP {response.status} {body[:200]}"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        if failure := await self._submit_mute_op(group_openid, member_openid, "add", expire_at, "禁言"):
+            return failure
 
         normalized_reason = str(reason or "").strip()
         self.ctx.logger.info(
@@ -1026,6 +1166,66 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             "user_id": target_user_id,
             "duration": normalized_duration,
             "reason": normalized_reason,
+        }
+
+    @Tool(
+        UNMUTE_TOOL_NAME,
+        platforms=PLATFORM,
+        description=(
+            "解除 QQ 群聊中某位成员的禁言，目标由该成员的消息 ID 指定。"
+            "适用于禁言到期前提前放行；群主与管理员平台不允许禁言，因此也无需解除。"
+            "目标用户需能解析出 OpenID（其消息经本适配器收到，或已通过 /assign_id 绑定）。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="msg_id",
+                param_type=ToolParamType.STRING,
+                description="被解除禁言的目标所发送的消息 ID。",
+                required=True,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_unmute(self, msg_id: Any = "", **kwargs: Any) -> Dict[str, Any]:
+        """解除发送者禁言（QQ 官方 restrict_chat_setting 的 op=del）。"""
+        stream_id = str(kwargs.get("stream_id") or "")
+        if not self._ready:
+            return {"success": False, "error": "QQ 官方网关未连接"}
+
+        normalized_msg_id = str(msg_id or "").strip()
+        if not normalized_msg_id:
+            return {"success": False, "error": "缺少目标消息 ID"}
+
+        target = await self._locate_mute_target(normalized_msg_id, stream_id, "解除禁言")
+        if error := target.get("error"):
+            return {"success": False, "error": error}
+        normalized_group_id = target["group_id"]
+        group_openid = target["group_openid"]
+        if not self._mute_group_allowed(normalized_group_id, group_openid):
+            return {"success": False, "error": f"群 {normalized_group_id} 不在禁言白名单内"}
+
+        target_user_id = target["user_id"]
+        target_display_name = target["display_name"]
+        member_openid = target["member_openid"]
+        if not member_openid:
+            return {
+                "success": False,
+                "error": f"无法解析 {target_display_name} 的 OpenID，需其消息经本适配器接收或先 /assign_id 绑定",
+            }
+
+        # 解除禁言按官方要求把 mute_expire_at 传空串，表示立即解除。
+        if failure := await self._submit_mute_op(group_openid, member_openid, "del", "", "解除禁言"):
+            return failure
+
+        self.ctx.logger.info(
+            "QQ 官方解除禁言: group=%s user=%s(%s)", normalized_group_id, target_display_name, member_openid
+        )
+        return {
+            "success": True,
+            "content": f"已解除 {target_display_name} 的禁言。",
+            "group_id": normalized_group_id,
+            "user_id": target_user_id,
         }
 
     @Tool(

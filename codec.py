@@ -16,6 +16,36 @@ PRIVATE_EVENT = "C2C_MESSAGE_CREATE"
 GROUP_EVENTS = {GROUP_EVENT, GROUP_MESSAGE_EVENT}
 SUPPORTED_EVENTS = GROUP_EVENTS | {PRIVATE_EVENT}
 
+# 群事件与消息事件共用 intent 位：消息与机器人/群状态事件走 1 << 25，
+# 成员维度事件（成员入群/退群、加群申请）走 1 << 24，后者需在开放平台单独申请权限。
+GROUP_AND_C2C_EVENT = 1 << 25
+GROUP_MEMBER_EVENT = 1 << 24
+
+GROUP_ADD_ROBOT = "GROUP_ADD_ROBOT"
+GROUP_DEL_ROBOT = "GROUP_DEL_ROBOT"
+GROUP_MSG_RECEIVE = "GROUP_MSG_RECEIVE"
+GROUP_MSG_REJECT = "GROUP_MSG_REJECT"
+GROUP_MEMBER_ADD = "GROUP_MEMBER_ADD"
+GROUP_MEMBER_REMOVE = "GROUP_MEMBER_REMOVE"
+GROUP_JOIN_REQUEST = "GROUP_JOIN_REQUEST"
+
+# 成员维度事件：随 1 << 24 推送，缺少权限时整条订阅会被网关拒绝。
+GROUP_MEMBER_EVENTS = frozenset({GROUP_MEMBER_ADD, GROUP_MEMBER_REMOVE, GROUP_JOIN_REQUEST})
+# 机器人/群状态事件：随消息事件的 1 << 25 一起推送。
+GROUP_ROBOT_EVENTS = frozenset({GROUP_ADD_ROBOT, GROUP_DEL_ROBOT, GROUP_MSG_RECEIVE, GROUP_MSG_REJECT})
+GROUP_NOTICE_EVENTS = GROUP_MEMBER_EVENTS | GROUP_ROBOT_EVENTS
+
+# 事件的中文标签，用于通知消息前缀与日志；宿主按「[事件-xxx]」约定识别通知消息。
+GROUP_EVENT_LABELS = {
+    GROUP_ADD_ROBOT: "机器人入群",
+    GROUP_DEL_ROBOT: "机器人退群",
+    GROUP_MSG_RECEIVE: "开启群消息接收",
+    GROUP_MSG_REJECT: "关闭群消息接收",
+    GROUP_MEMBER_ADD: "群成员加入",
+    GROUP_MEMBER_REMOVE: "群成员退出",
+    GROUP_JOIN_REQUEST: "加群申请",
+}
+
 QQ_ATTACHMENT_TAG_PATTERN = re.compile(r"<attachmentType=.*?>", re.IGNORECASE)
 QQ_FACE_TAG_PATTERN = re.compile(r"<faceType=.*?>", re.IGNORECASE)
 QQ_MENTION_TOKEN_PATTERN = re.compile(r"<@!?([0-9A-Za-z_-]+)>")
@@ -202,6 +232,165 @@ def summarize_payload(payload: Mapping[str, Any]) -> str:
     except (TypeError, ValueError):
         summary = str(payload)
     return summary[:600]
+
+
+def _event_timestamp(payload: Mapping[str, Any]) -> float:
+    """群事件的时间戳：Unix 秒整数优先，其次 RFC3339（加群申请用 apply_at）。"""
+
+    candidates = [payload.get("timestamp"), payload.get("apply_at")]
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return datetime.now().timestamp()
+
+
+def _event_actor_name(payload: Mapping[str, Any], openid: str, fallback: str) -> str:
+    """群事件没有昵称时用 OpenID 兜底，便于其它插件继续反查。"""
+
+    return str(payload.get("username") or "").strip() or openid or fallback
+
+
+def decode_group_event(
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    event_id: str = "",
+    id_map: Optional[Mapping[str, Mapping[str, str]]] = None,
+) -> Dict[str, Any]:
+    """把官方群事件转换为结构化记录，供公开接口与通知消息共用。
+
+    记录里同时给出 OpenID 与统一 ID（已绑定时为真实 QQ 号/群号），
+    原始事件体保留在 ``payload``，避免其它插件需要重新理解官方字段。
+    """
+
+    if event_type not in GROUP_NOTICE_EVENTS:
+        raise ValueError(f"不支持的群事件类型: {event_type}")
+
+    group_openid = str(payload.get("group_openid") or "").strip()
+    if not group_openid:
+        raise ValueError("群事件缺少 group_openid")
+
+    group_map = (id_map or {}).get("group") or {}
+    user_map = (id_map or {}).get("user") or {}
+    unified_group = str(group_map.get(group_openid) or "") or group_openid
+
+    # 成员维度事件用 member_openid；机器人/群状态事件用 op_member_openid 表示操作者。
+    member_openid = str(payload.get("member_openid") or "").strip()
+    operator_openid = str(payload.get("op_member_openid") or payload.get("invited_by") or "").strip()
+    subject_openid = member_openid or operator_openid
+    unified_subject = str(user_map.get(subject_openid) or "") or subject_openid
+
+    label = GROUP_EVENT_LABELS.get(event_type, event_type)
+    if event_type in {GROUP_MEMBER_ADD, GROUP_MEMBER_REMOVE}:
+        actor = _event_actor_name(payload, member_openid, "未知成员")
+        summary = f"{actor} {'加入了群聊' if event_type == GROUP_MEMBER_ADD else '退出了群聊'}"
+    elif event_type == GROUP_JOIN_REQUEST:
+        actor = _event_actor_name(payload, member_openid, "未知用户")
+        summary = f"{actor} 申请加群"
+        if risk_tips := str(payload.get("risk_tips") or "").strip():
+            summary = f"{summary}（安全提示：{risk_tips}）"
+    elif event_type in {GROUP_ADD_ROBOT, GROUP_DEL_ROBOT}:
+        actor = _event_actor_name(payload, operator_openid, "未知成员")
+        summary = f"机器人被 {actor} {'拉入' if event_type == GROUP_ADD_ROBOT else '移出'}群聊"
+    else:
+        summary = "群管理员开启了群消息接收通知" if event_type == GROUP_MSG_RECEIVE else "群管理员关闭了群消息接收通知"
+
+    record: Dict[str, Any] = {
+        "event": event_type,
+        "label": label,
+        "event_id": str(event_id or payload.get("id") or "").strip(),
+        "timestamp": _event_timestamp(payload),
+        "group_openid": group_openid,
+        "group_id": unified_group,
+        "member_openid": member_openid,
+        "member_id": unified_subject if member_openid else "",
+        "operator_openid": operator_openid,
+        "operator_id": str(user_map.get(operator_openid) or "") or operator_openid,
+        "username": str(payload.get("username") or "").strip(),
+        "summary": f"[事件-{label}] {summary}",
+        "payload": dict(payload),
+    }
+    if event_type == GROUP_JOIN_REQUEST:
+        record.update(
+            {
+                "join_request_id": str(payload.get("join_request_id") or "").strip(),
+                "apply_at": str(payload.get("apply_at") or "").strip(),
+                "apply_source": str(payload.get("apply_source") or "").strip(),
+                "risk_tips": str(payload.get("risk_tips") or "").strip(),
+                "is_bot": bool(payload.get("bot")),
+                "verify_info": payload.get("verify_info"),
+                "auto_approved": payload.get("auto_approved"),
+            }
+        )
+    return record
+
+
+def build_group_notice_message(
+    record: Mapping[str, Any],
+    account_id: str,
+    *,
+    unified_account_id: str = "",
+) -> Dict[str, Any]:
+    """把群事件记录转换为宿主的通知消息（is_notify=True）。
+
+    宿主会为通知消息登记会话并输出到聊天流，但不写入上下文记忆、不携带消息 ID，
+    与 NapCat 适配器的通知消息约定一致；额外的原始事件体放在 additional_config 中，
+    供其它插件按 ``qq_official_notice_type``/``qq_official_notice_payload`` 识别。
+    """
+
+    event_type = str(record.get("event") or "").strip()
+    summary = str(record.get("summary") or "").strip()
+    group_openid = str(record.get("group_openid") or "").strip()
+    member_openid = str(record.get("member_openid") or "").strip()
+    operator_openid = str(record.get("operator_openid") or "").strip()
+    # 通知消息同样要满足宿主对 user_info 的校验：昵称与 ID 都不能为空。
+    subject_openid = member_openid or operator_openid or group_openid
+    nickname = str(record.get("username") or "").strip() or subject_openid or "群事件"
+
+    additional_config: Dict[str, Any] = {
+        "qq_official_group_openid": group_openid,
+        "platform_io_target_group_id": str(record.get("group_id") or "") or group_openid,
+        "qq_official_notice_type": event_type,
+        "qq_official_notice_payload": record.get("payload") or {},
+    }
+    if subject_openid:
+        additional_config["qq_official_user_openid"] = subject_openid
+        additional_config["platform_io_target_user_id"] = str(record.get("member_id") or "") or subject_openid
+
+    event_id = str(record.get("event_id") or "").strip()
+    message_id = event_id or f"{event_type}:{int(float(record.get('timestamp') or 0))}:{subject_openid}"
+    return {
+        "message_id": message_id,
+        "timestamp": str(record.get("timestamp") or datetime.now().timestamp()),
+        "platform": PLATFORM,
+        "account_id": unified_account_id or account_id,
+        "scope": None,
+        "message_info": {
+            "user_info": {"user_id": subject_openid, "user_nickname": nickname},
+            "group_info": {"group_id": str(record.get("group_id") or "") or group_openid, "group_name": ""},
+            "additional_config": additional_config,
+        },
+        "raw_message": [{"type": "text", "data": summary}],
+        "processed_plain_text": summary,
+        "is_at": False,
+        "is_mentioned": False,
+        "is_emoji": False,
+        "is_picture": False,
+        "is_command": False,
+        "is_notify": True,
+        "session_id": "",
+    }
 
 
 def _rewrite_mention_tokens(
