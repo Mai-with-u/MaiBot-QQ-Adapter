@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import ClassVar, List
+from typing import ClassVar, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -65,9 +65,88 @@ class RecallSettings(PluginConfigBase):
     )
 
 
+class PrivateMenuItem(PluginConfigBase):
+    """单聊自定义菜单项，对应官方 /v2/menu 的 Item。"""
+
+    name: str = Field(
+        default="",
+        description="按钮名称，最多 10 个字符，一个中文汉字按 2 个字符计算",
+        json_schema_extra={"label": "按钮名称"},
+    )
+    type: Literal["send_message", "link", "menu"] = Field(
+        default="send_message",
+        description="按钮类型：填入指令 / 跳转链接 / 二级菜单",
+        json_schema_extra={"label": "按钮类型"},
+    )
+    value: str = Field(
+        default="",
+        description="按钮类型为「填入指令」时填点击后填入输入框的内容（如 /help）；为「跳转链接」时填以 https:// 开头的地址",
+        json_schema_extra={"label": "按钮内容"},
+    )
+    sub_items: List[str] = Field(
+        default_factory=list,
+        description="仅「二级菜单」类型生效，最多 5 项，每项为点击后填入输入框的指令；二级菜单不支持再嵌套",
+        json_schema_extra={"label": "二级菜单项"},
+    )
+
+
+class GroupMenuItem(PluginConfigBase):
+    """群聊指令面板项，对应官方 /v2/panels 的 PanelItem。"""
+
+    name: str = Field(
+        default="",
+        description="指令文本，最多 14 个字符，约 7 个中文汉字；点击后填入群聊输入框",
+        json_schema_extra={"label": "指令文本"},
+    )
+    description: str = Field(
+        default="",
+        description="指令描述，最多 30 个字符，约 15 个中文汉字",
+        json_schema_extra={"label": "指令描述"},
+    )
+    type: Literal["command", "link"] = Field(
+        default="command",
+        description="元素类型：指令 / 跳转链接",
+        json_schema_extra={"label": "元素类型"},
+    )
+    link: str = Field(
+        default="",
+        description="仅「跳转链接」类型生效，必须以 https:// 开头",
+        json_schema_extra={"label": "跳转链接"},
+    )
+    only_admin: bool = Field(default=False, description="是否仅群管理员可点击")
+
+
+class MenuSettings(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "指令菜单"
+    __ui_order__: ClassVar[int] = 4
+
+    private_enabled: bool = Field(
+        default=False,
+        description="启用后按下方列表下发所有单聊的自定义菜单；关闭时不改动平台现有菜单",
+        json_schema_extra={"label": "启用单聊菜单"},
+    )
+    private_items: List[PrivateMenuItem] = Field(
+        default_factory=list,
+        max_length=10,
+        description="单聊自定义菜单项，最多 10 项；留空表示清空平台现有菜单",
+        json_schema_extra={"label": "单聊菜单项"},
+    )
+    group_enabled: bool = Field(
+        default=False,
+        description="启用后按下方列表下发所有群聊的指令面板；关闭时不改动平台现有面板",
+        json_schema_extra={"label": "启用群聊面板"},
+    )
+    group_items: List[GroupMenuItem] = Field(
+        default_factory=list,
+        max_length=20,
+        description="群聊指令面板项，最多 20 项；留空表示删除适配器创建的全局面板",
+        json_schema_extra={"label": "群聊面板项"},
+    )
+
+
 class AdvancedSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "高级设置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
 
     reconnect_delay_sec: float = Field(
         default=5.0,
@@ -83,4 +162,5 @@ class AdapterSettings(PluginConfigBase):
     qq_official: QQOfficialSettings = Field(default_factory=QQOfficialSettings)
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
+    menu: MenuSettings = Field(default_factory=MenuSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)

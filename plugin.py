@@ -52,6 +52,16 @@ MUTE_TOOL_NAME = "mute"
 RECALL_TOOL_NAME = "recall_message"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 官方自定义菜单（单聊）与指令面板（群聊）的限额，见 /v2/menu 与 /v2/panels 文档。
+PRIVATE_MENU_MAX_ITEMS = 10
+PRIVATE_SUB_MENU_MAX_ITEMS = 5
+GROUP_PANEL_MAX_ITEMS = 20
+MENU_ITEM_NAME_LIMIT = 10
+SUB_MENU_ITEM_NAME_LIMIT = 14
+PANEL_ITEM_NAME_LIMIT = 14
+PANEL_ITEM_DESC_LIMIT = 30
+GROUP_PANEL_REMARK = "MaiBot-QQ-Adapter"
+PANEL_PAGE_LIMIT = 50
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -65,6 +75,9 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         ConfigWidget(id="login_start", kind="action", label="生成 / 刷新二维码",
                      confirmation="扫码授权成功后将替换 AppID / AppSecret 并重新连接，是否继续？"),
         ConfigWidget(id="login_cancel", kind="action", label="取消扫码"),
+        ConfigWidget(id="menu", kind="status", label="指令菜单"),
+        # 菜单下发受官方写接口频控（/v2/menu 5 QPM、/v2/panels 10 QPM），只在配置变更或手动触发时写入。
+        ConfigWidget(id="menu_sync", kind="action", label="立即同步指令菜单"),
         ConfigWidget(id="reconnect", kind="action", label="重新连接"),
     ]
 
@@ -83,6 +96,11 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                                        tone="error" if login["state"] == "error" else "neutral"),
             "login_start": ConfigWidgetState(disabled=login["state"] in {"creating", "saving"}),
             "login_cancel": ConfigWidgetState(visible=active, disabled=login["state"] == "saving"),
+            "menu": ConfigWidgetState(
+                text=self._menu_message or self._menu_idle_text(),
+                tone="error" if self._menu_failed else "neutral",
+            ),
+            "menu_sync": ConfigWidgetState(disabled=not self._ready or not self._menu_managed()),
             "reconnect": ConfigWidgetState(disabled=not configured or active),
         }
 
@@ -91,6 +109,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             await self.webui_login_start()
         elif action_id == "login_cancel":
             await self.webui_login_cancel()
+        elif action_id == "menu_sync":
+            await self._sync_menus(force=True)
         elif action_id == "reconnect":
             async with self._connection_lock:
                 await self._stop()
@@ -127,6 +147,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._qr_login = QRLogin(self._apply_qr_credentials)
         self._gateway_state_lock = asyncio.Lock()
         self._inbound_ready = asyncio.Event()
+        # 指令菜单只在连接就绪后下发，记录上次成功下发时的配置签名，避免重连时重复写平台接口。
+        self._menu_lock = asyncio.Lock()
+        self._menu_task: Optional[asyncio.Task[None]] = None
+        self._menu_synced_signature = ""
+        self._menu_message = ""
+        self._menu_failed = False
 
     async def on_load(self) -> None:
         # 页面在连接关闭或凭据尚未填写时也需要展示已有绑定。
@@ -196,6 +222,230 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 continue
             self.ctx.logger.info("%s工具已%s", label, "启用" if enabled else "停用")
 
+    def _menu_managed(self) -> bool:
+        """是否由适配器接管了至少一个场景的指令菜单。"""
+        return self.config.menu.private_enabled or self.config.menu.group_enabled
+
+    def _menu_idle_text(self) -> str:
+        """配置页在尚未下发菜单时展示的提示。"""
+        if not self._menu_managed():
+            return "未接管：需在下方「指令菜单」中启用单聊菜单或群聊面板"
+        return "尚未同步，连接成功后自动下发"
+
+    def _menu_signature(self) -> str:
+        """当前菜单配置的指纹，用于跳过内容未变的重复下发。"""
+        return json.dumps(self.config.menu.model_dump(), ensure_ascii=False, sort_keys=True)
+
+    def _schedule_menu_sync(self) -> None:
+        """连接就绪后在后台按需下发菜单，不阻塞网关状态更新。"""
+        if not self._menu_managed():
+            return
+        if self._menu_task is not None and not self._menu_task.done():
+            return
+        self._menu_task = asyncio.create_task(self._sync_menus(), name="qq-official-menu-sync")
+
+    async def _sync_menus(self, *, force: bool = False) -> None:
+        """把 [menu] 配置下发到平台；配置未变化且上次成功时跳过写接口。"""
+        if not self._menu_managed():
+            if force:
+                self._menu_message = self._menu_idle_text()
+                self._menu_failed = False
+            return
+        if not self._ready:
+            return
+        signature = self._menu_signature()
+        async with self._menu_lock:
+            if not force and signature == self._menu_synced_signature:
+                return
+            try:
+                summary: List[str] = []
+                if self.config.menu.private_enabled:
+                    summary.append(f"单聊菜单 {await self._sync_private_menu()} 项")
+                if self.config.menu.group_enabled:
+                    summary.append(f"群聊面板 {await self._sync_group_panel()} 项")
+            except Exception as exc:
+                self._menu_message = f"同步失败：{exc}"
+                self._menu_failed = True
+                self.ctx.logger.warning("QQ 官方指令菜单同步失败: %s", exc)
+                return
+            self._menu_synced_signature = signature
+            self._menu_message = "已同步 " + " / ".join(summary)
+            self._menu_failed = False
+
+    async def _sync_private_menu(self) -> int:
+        """下发单聊自定义菜单，返回菜单项数量。
+
+        /v2/menu 是覆盖式接口，没有按项编辑能力：列表为空即清空平台上的菜单。
+        """
+        items = self._build_private_menu_items()
+        current = await self._api_get("/v2/menu")
+        menu = current.get("menu")
+        existing = menu.get("items") if isinstance(menu, Mapping) else None
+        if self._private_items_identical(existing, items):
+            self.ctx.logger.debug("QQ 官方单聊指令菜单无变化，跳过下发")
+            return len(items)
+        await self._api_put("/v2/menu", {"menu": {"items": items}})
+        self.ctx.logger.info("QQ 官方单聊指令菜单已下发: %d 项", len(items))
+        return len(items)
+
+    async def _sync_group_panel(self) -> int:
+        """下发所有群聊共用的全局面板（scope=group + target_type=all），返回面板项数量。
+
+        只维护 target_type=all 的全局面板，不动用户在别处创建的按群面板。
+        """
+        items = self._build_group_panel_items()
+        records = await self._list_group_panels()
+        global_panels = [record for record in records if str(record.get("target_type") or "") == "all"]
+        if not items:
+            deleted = 0
+            for record in global_panels:
+                panel_id = str(record.get("panel_id") or "").strip()
+                if panel_id:
+                    await self._api_delete(f"/v2/panels/{quote(panel_id, safe='')}")
+                    deleted += 1
+            if deleted:
+                self.ctx.logger.info("QQ 官方群聊指令面板已清空: %d 个", deleted)
+            return 0
+        for record in global_panels:
+            panel = record.get("panel")
+            existing = panel.get("items") if isinstance(panel, Mapping) else None
+            if self._panel_items_identical(existing, items):
+                self.ctx.logger.debug("QQ 官方群聊指令面板无变化，跳过下发")
+                return len(items)
+        panel_id = next(
+            (
+                str(record.get("panel_id") or "").strip()
+                for record in global_panels
+                if str(record.get("panel_id") or "").strip()
+            ),
+            "",
+        )
+        panel = {"items": items, "remark": GROUP_PANEL_REMARK}
+        if panel_id:
+            await self._api_put(f"/v2/panels/{quote(panel_id, safe='')}", {"panel": panel})
+        else:
+            await self._api_post("/v2/panels", {"scope": "group", "target_type": "all", "panel": panel})
+        self.ctx.logger.info("QQ 官方群聊指令面板已下发: %d 项", len(items))
+        return len(items)
+
+    async def _list_group_panels(self) -> List[Mapping[str, Any]]:
+        """分页拉取本机器人已创建的群聊指令面板。"""
+        records: List[Mapping[str, Any]] = []
+        cursor = ""
+        seen: Set[str] = set()
+        while True:
+            params: Dict[str, Any] = {"scope": "group", "limit": PANEL_PAGE_LIMIT}
+            if cursor:
+                params["cursor"] = cursor
+            page = await self._api_get("/v2/panels", params)
+            page_records = page.get("records")
+            if isinstance(page_records, list):
+                records.extend(item for item in page_records if isinstance(item, Mapping))
+            next_cursor = str(page.get("next_cursor") or "").strip()
+            if page.get("is_end") or not next_cursor or next_cursor in seen:
+                return records
+            seen.add(next_cursor)
+            cursor = next_cursor
+
+    def _private_items_identical(self, existing: Any, desired: List[Dict[str, Any]]) -> bool:
+        """比较平台返回的菜单与将要下发的菜单，忽略平台附带的字段差异。"""
+        if not isinstance(existing, list):
+            return False
+        current = [self._private_menu_spec(item) for item in existing if isinstance(item, Mapping)]
+        return current == [self._private_menu_spec(item) for item in desired]
+
+    def _private_menu_spec(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        """把单聊菜单项归一化成可比较的结构。"""
+        kind = str(item.get("type") or "")
+        spec: Dict[str, Any] = {"name": str(item.get("name") or ""), "type": kind}
+        if kind == "menu":
+            sub_items = item.get("sub_menu_items")
+            spec["sub_menu_items"] = [
+                {
+                    "name": str(sub.get("name") or ""),
+                    "type": str(sub.get("type") or ""),
+                    "send_message": str(sub.get("send_message") or ""),
+                }
+                for sub in (sub_items if isinstance(sub_items, list) else [])
+                if isinstance(sub, Mapping)
+            ]
+        elif kind == "link":
+            spec["link"] = str(item.get("link") or "")
+        else:
+            spec["send_message"] = str(item.get("send_message") or "")
+        return spec
+
+    def _panel_items_identical(self, existing: Any, desired: List[Dict[str, Any]]) -> bool:
+        """比较平台返回的群聊面板与将要下发的面板。"""
+        if not isinstance(existing, list):
+            return False
+        current = [self._panel_item_spec(item) for item in existing if isinstance(item, Mapping)]
+        return current == [self._panel_item_spec(item) for item in desired]
+
+    def _panel_item_spec(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        """把群聊面板项归一化成可比较的结构。"""
+        return {
+            "name": str(item.get("name") or ""),
+            "desc": str(item.get("desc") or ""),
+            "type": str(item.get("type") or ""),
+            "only_admin": bool(item.get("only_admin")),
+            "link": str(item.get("link") or ""),
+        }
+
+    def _build_private_menu_items(self) -> List[Dict[str, Any]]:
+        """把配置里的单聊菜单项转成官方 /v2/menu 的 Item，跳过信息不完整的项。"""
+        items: List[Dict[str, Any]] = []
+        for entry in self.config.menu.private_items[:PRIVATE_MENU_MAX_ITEMS]:
+            name = entry.name.strip()[:MENU_ITEM_NAME_LIMIT]
+            if not name:
+                self.ctx.logger.warning("跳过缺少按钮名称的单聊菜单项")
+                continue
+            value = entry.value.strip()
+            if entry.type == "menu":
+                sub_items = [
+                    {"name": text[:SUB_MENU_ITEM_NAME_LIMIT], "type": "send_message", "send_message": text}
+                    for text in (item.strip() for item in entry.sub_items[:PRIVATE_SUB_MENU_MAX_ITEMS])
+                    if text
+                ]
+                if not sub_items:
+                    self.ctx.logger.warning("跳过没有二级菜单项的单聊菜单: name=%s", name)
+                    continue
+                items.append({"name": name, "type": "menu", "sub_menu_items": sub_items})
+            elif entry.type == "link":
+                if not value.startswith("https://"):
+                    self.ctx.logger.warning("跳过链接不是 https:// 开头的单聊菜单: name=%s", name)
+                    continue
+                items.append({"name": name, "type": "link", "link": value})
+            else:
+                if not value:
+                    self.ctx.logger.warning("跳过缺少按钮内容的单聊菜单: name=%s", name)
+                    continue
+                items.append({"name": name, "type": "send_message", "send_message": value})
+        return items
+
+    def _build_group_panel_items(self) -> List[Dict[str, Any]]:
+        """把配置里的群聊面板项转成官方 PanelItem，跳过信息不完整的项。"""
+        items: List[Dict[str, Any]] = []
+        for entry in self.config.menu.group_items[:GROUP_PANEL_MAX_ITEMS]:
+            name = entry.name.strip()[:PANEL_ITEM_NAME_LIMIT]
+            if not name:
+                self.ctx.logger.warning("跳过缺少指令文本的群聊面板项")
+                continue
+            item: Dict[str, Any] = {
+                "name": name,
+                "desc": entry.description.strip()[:PANEL_ITEM_DESC_LIMIT],
+                "type": entry.type,
+                "only_admin": bool(entry.only_admin),
+            }
+            if entry.type == "link":
+                link = entry.link.strip()
+                if not link.startswith("https://"):
+                    self.ctx.logger.warning("跳过链接不是 https:// 开头的群聊面板项: name=%s", name)
+                    continue
+                item["link"] = link
+            items.append(item)
+        return items
+
     def _start(self) -> None:
         settings = self.config.qq_official
         if not settings.app_id.strip() or not settings.app_secret.strip():
@@ -218,6 +468,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._dispatch_tasks.clear()
+        menu_task = self._menu_task
+        self._menu_task = None
+        if menu_task is not None:
+            menu_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await menu_task
         if worker is not None:
             with suppress(asyncio.CancelledError):
                 await worker
@@ -818,6 +1074,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             self._ready = ready and accepted
             if self._ready:
                 self._inbound_ready.set()
+                self._schedule_menu_sync()
             if ready and not accepted:
                 raise RuntimeError("MaiBot 未接受 QQ 官方消息网关路由")
 
@@ -1255,15 +1512,22 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             self._replies[key] = (received_at, sequence)
             return {"msg_id": key[2], "msg_seq": sequence}
 
-    async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
+    async def _api_request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """调用官方 OpenAPI，HTTP 错误时带上平台错误码与说明抛出。"""
         session = self._require_session()
         token = await self._authorize()
-        async with session.post(
-            self._api_url(path),
-            headers={"Authorization": f"QQBot {token}"},
-            json=dict(payload),
-        ) as response:
+        request_kwargs: Dict[str, Any] = {"headers": {"Authorization": f"QQBot {token}"}}
+        if payload is not None:
+            request_kwargs["json"] = dict(payload)
+        if params is not None:
+            request_kwargs["params"] = dict(params)
+        async with session.request(method, self._api_url(path), **request_kwargs) as response:
             text = await response.text()
             try:
                 result = json.loads(text) if text.strip() else {}
@@ -1277,6 +1541,22 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 )
                 raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
         return result
+
+    async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
+        return await self._api_request("POST", path, payload)
+
+    async def _api_get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（GET）。"""
+        return await self._api_request("GET", path, params=params)
+
+    async def _api_put(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（PUT）。"""
+        return await self._api_request("PUT", path, payload)
+
+    async def _api_delete(self, path: str) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（DELETE）。"""
+        return await self._api_request("DELETE", path)
 
     async def _upload_image(self, base_path: str, binary: bytes, file_name: str) -> str:
         """按官方分片上传流程上传图片，返回用于 msg_type=7 的 file_info。
