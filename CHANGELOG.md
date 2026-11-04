@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.10 - 2026-11-05
+
+### 主要功能
+
+- 富媒体出站：支持发送视频（mp4）与语音（silk/mp3/wav/ogg），与图片、表情统一走官方分片上传换取 `file_info` 后以 `msg_type=7` 发送。上传类型按内容自动判定：图片/表情 `file_type=1`、视频 `file_type=2`、语音 `file_type=3`。
+
+### 细节
+
+- 上传流程按官方最新文档实现：`upload_prepare` → 分片 PUT 到预签名地址 → 每片 `upload_part_finish` → `files` 携带 `upload_id` 合并取 `file_info`，避免直接上传整文件导致的失败；预签名 PUT 不携带 `QQBot` 鉴权头。
+- 媒体格式按文件头识别（图片 jpg/png/gif/webp/bmp、视频 mp4、语音 silk/mp3/wav/ogg 及 0x02/0x03 前导标记的 SILK 流），不再依赖扩展名判断；不在官方支持范围内时返回可读的发送失败原因。
+- 宿主的 `file` 段可发送：带 `base64` 时本地分片上传，仅带 `url` 时交由官方转存（不在插件内下载任意地址）。官方未开放文件出站（`file_type=4`），其它格式直接返回发送失败。
+
 ## 0.4.6 - 2026-10-27
 
 ### 修复

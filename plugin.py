@@ -1142,10 +1142,16 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             # reply 段是宿主明确指定的引用目标；没有段时回退到消息级 reply_to。
             quote_target = reply_target_id or reply_to
             base_path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}"
-            # 官方一条消息只承载一种内容，文本与图片按原顺序逐条发送。
+            # 官方一条消息只承载一种内容，文本与富媒体按原顺序逐条发送。
             for index, part in enumerate(parts):
                 if part["kind"] == "media":
-                    file_info = await self._upload_image(base_path, part["binary"], part["file_name"])
+                    file_info = await self._upload_media(
+                        base_path,
+                        part["file_type"],
+                        part["file_name"],
+                        part.get("binary"),
+                        str(part.get("url") or ""),
+                    )
                     body: Dict[str, Any] = {"msg_type": 7, "media": {"file_info": file_info}}
                 else:
                     body = part["body"]
@@ -1278,15 +1284,35 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
         return result
 
-    async def _upload_image(self, base_path: str, binary: bytes, file_name: str) -> str:
-        """按官方分片上传流程上传图片，返回用于 msg_type=7 的 file_info。
+    async def _upload_media(
+        self,
+        base_path: str,
+        file_type: int,
+        file_name: str,
+        binary: Optional[bytes] = None,
+        url: str = "",
+    ) -> str:
+        """按官方上传流程取得 file_info，返回用于 msg_type=7 的富媒体信息。
 
-        流程：upload_prepare 取预签名分片 URL → 逐片 PUT 并 upload_part_finish → 携带 upload_id 调用 files 合并。
+        二进制内容走官方推荐的分片上传：upload_prepare 取预签名分片 URL → 逐片 PUT 并
+        upload_part_finish → 携带 upload_id 调用 files 合并；只有 URL 时交给平台转存，
+        避免插件自行下载任意地址。file_type 由官方定义：1 图片、2 视频、3 语音。
         """
+        if binary is None:
+            if not url:
+                raise RuntimeError("QQ 富媒体上传缺少文件内容（二进制或 URL）")
+            result = await self._api_post(
+                f"{base_path}/files",
+                {"file_type": file_type, "url": url, "srv_send_msg": False},
+            )
+            file_info = str(result.get("file_info") or "")
+            if not file_info:
+                raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
+            return file_info
         prepare = await self._api_post(
             f"{base_path}/upload_prepare",
             {
-                "file_type": 1,
+                "file_type": file_type,
                 "file_size": str(len(binary)),
                 "file_name": file_name,
                 "md5": md5(binary).hexdigest(),
@@ -1298,25 +1324,25 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         block_size = int(prepare.get("block_size") or 0)
         upload_parts = prepare.get("parts")
         if not upload_id or block_size <= 0 or not isinstance(upload_parts, list) or not upload_parts:
-            raise RuntimeError("QQ 图片预上传响应缺少 upload_id、block_size 或 parts")
+            raise RuntimeError("QQ 富媒体预上传响应缺少 upload_id、block_size 或 parts")
         # 文档写分片序号从 0 开始，实测（2026-09-30）返回从 1 开始，按实际最小序号计算偏移。
         index_base = min(int(upload_part["index"]) for upload_part in upload_parts)
         if index_base not in (0, 1):
-            raise RuntimeError(f"QQ 图片预上传返回的分片序号起点无效: {index_base}")
+            raise RuntimeError(f"QQ 富媒体预上传返回的分片序号起点无效: {index_base}")
         session = self._require_session()
         for upload_part in upload_parts:
             index = int(upload_part["index"])
             presigned_url = str(upload_part.get("presigned_url") or "")
             if not presigned_url.startswith("https://"):
-                raise RuntimeError(f"QQ 图片分片 {index} 的预签名地址无效")
+                raise RuntimeError(f"QQ 富媒体分片 {index} 的预签名地址无效")
             offset = (index - index_base) * block_size
             chunk = binary[offset : offset + block_size]
             if not chunk:
-                raise RuntimeError(f"QQ 图片分片 {index} 超出文件范围")
+                raise RuntimeError(f"QQ 富媒体分片 {index} 超出文件范围")
             # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头。
             async with session.put(presigned_url, data=chunk) as response:
                 if response.status >= 400:
-                    raise RuntimeError(f"QQ 图片分片 {index} 上传失败: HTTP {response.status}")
+                    raise RuntimeError(f"QQ 富媒体分片 {index} 上传失败: HTTP {response.status}")
             await self._api_post(
                 f"{base_path}/upload_part_finish",
                 {
@@ -1328,11 +1354,11 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             )
         result = await self._api_post(
             f"{base_path}/files",
-            {"file_type": 1, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
+            {"file_type": file_type, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
         )
         file_info = str(result.get("file_info") or "")
         if not file_info:
-            raise RuntimeError("QQ 图片上传响应缺少 file_info")
+            raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
         return file_info
 
 

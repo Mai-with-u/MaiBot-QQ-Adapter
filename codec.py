@@ -20,6 +20,23 @@ QQ_ATTACHMENT_TAG_PATTERN = re.compile(r"<attachmentType=.*?>", re.IGNORECASE)
 QQ_FACE_TAG_PATTERN = re.compile(r"<faceType=.*?>", re.IGNORECASE)
 QQ_MENTION_TOKEN_PATTERN = re.compile(r"<@!?([0-9A-Za-z_-]+)>")
 
+# 官方富媒体按 file_type 区分上传类型：1 图片、2 视频、3 语音（4 文件暂未开放发送）。
+# 可发送的格式以官方文档为准：图片 jpg/png/gif/webp/bmp、视频 mp4、语音 silk/mp3/wav/ogg。
+MEDIA_FILE_TYPE_BY_EXTENSION = {
+    "jpg": 1,
+    "png": 1,
+    "gif": 1,
+    "webp": 1,
+    "bmp": 1,
+    "mp4": 2,
+    "silk": 3,
+    "mp3": 3,
+    "wav": 3,
+    "ogg": 3,
+}
+# 这些消息段都可以走富媒体通道；file 段仅在其内容被识别为视频/语音时才走富媒体。
+MEDIA_SEGMENT_TYPES = frozenset({"image", "emoji", "video", "voice"})
+
 
 def decode_message(
     event_type: str,
@@ -373,8 +390,9 @@ def encode_message(
     官方一条消息只能承载一种内容，因此：
     - 连续的文本/@ 段合并为一个 ``{"kind": "body", "body": {...}}``，含 @ 时以 markdown
       （msg_type=2）发送，否则为纯文本（msg_type=0）；
-    - 每个图片/表情段单独成为一个 ``{"kind": "media", "binary": bytes, "file_name": str}``，
-      由插件上传后以富媒体（msg_type=7）发送。
+    - 每个图片/表情/视频/语音段单独成为一个
+      ``{"kind": "media", "binary": bytes, "file_name": str, "file_type": int}``，
+      由插件按官方分片上传取得 file_info 后以富媒体（msg_type=7）发送。
 
     返回的第四项为 reply 段指向的被回复消息 ID（平台消息 id，非 REFIDX），
     由调用方转换为官方 message_reference；无 reply 段时为空串。
@@ -444,12 +462,15 @@ def encode_message(
                 # 纯数字是未绑定 OpenID 的 QQ 号，无法 @，退化为可读 @昵称。
                 parts.append(f"@{at_nickname} ")
             continue
-        if segment.get("type") in {"image", "emoji"}:
+        if segment.get("type") in MEDIA_SEGMENT_TYPES or segment.get("type") == "file":
+            # file 段只有内容能识别为视频/语音时才可发送，其余文件类型官方未开放，
+            # 由 _decode_media_segment 抛出可读错误。
+            media = _decode_media_segment(segment)
             _flush_text()
-            outbound.append({"kind": "media", **_decode_image_segment(segment)})
+            outbound.append({"kind": "media", **media})
             continue
         if segment.get("type") != "text":
-            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片与表情")
+            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片、表情、视频与语音")
         data = segment.get("data")
         if not isinstance(data, str):
             raise ValueError("出站文本段的数据必须是字符串")
@@ -460,32 +481,82 @@ def encode_message(
     return scene, target_id, outbound, reply_target_id
 
 
-def _decode_image_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
-    """取出图片/表情段的二进制数据，并按文件头确定上传文件名。"""
+def _decode_media_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
+    """取出一个待上传的富媒体段：二进制内容（或可转存的 URL）与官方上传类型。
+
+    图片、表情、视频、语音段直接携带 ``binary_data_base64``；``file`` 段的数据是宿主的
+    FileComponent 负载，可能带 base64 内容，也可能只带可下载 URL——此时不做本地下载，
+    把 URL 交给官方转存，避免插件自行抓取任意地址。
+    """
+    segment_type = str(segment.get("type") or "")
+    if segment_type == "file":
+        payload = segment.get("data")
+        file_data = payload if isinstance(payload, Mapping) else {}
+        raw_base64 = str(file_data.get("base64") or segment.get("binary_data_base64") or "").strip()
+        file_name = str(file_data.get("name") or "").strip()
+        if not raw_base64:
+            url = str(file_data.get("url") or "").strip()
+            if not url:
+                raise ValueError("出站 file 段缺少文件内容（base64 或 url），无法发送")
+            extension, file_type = _file_type_from_name(file_name or url)
+            if not file_type:
+                # 官方仅支持发送图片、视频、语音三类富媒体，其余文件类型未开放。
+                raise ValueError(f"出站 file 段暂不支持发送该格式的文件: {file_name or url}")
+            return {"url": url, "file_name": file_name or f"file.{extension}", "file_type": file_type}
+        binary = _decode_base64(raw_base64, segment_type)
+        extension, file_type = _detect_media_extension(binary)
+        if not file_type:
+            raise ValueError(f"出站 file 段暂不支持发送该格式的文件: {file_name or f'{len(binary)} 字节'}")
+        return {"binary": binary, "file_name": file_name or f"{hashlib.sha256(binary).hexdigest()}.{extension}", "file_type": file_type}
     raw_base64 = str(segment.get("binary_data_base64") or "").strip()
     if not raw_base64:
-        raise ValueError(f"出站{segment.get('type')}段缺少二进制数据")
-    try:
-        binary = base64.b64decode(raw_base64, validate=True)
-    except (binascii.Error, ValueError):
-        raise ValueError(f"出站{segment.get('type')}段的二进制数据不是有效的 Base64") from None
-    extension = _detect_image_extension(binary)
-    if not extension:
-        raise ValueError(f"出站{segment.get('type')}段不是可识别的图片格式")
+        raise ValueError(f"出站{segment_type}段缺少二进制数据，无法作为富媒体发送")
+    binary = _decode_base64(raw_base64, segment_type)
+    extension, file_type = _detect_media_extension(binary)
+    if not file_type:
+        raise ValueError(
+            f"出站{segment_type}段不是官方支持的媒体格式"
+            "（图片 jpg/png/gif/webp/bmp、视频 mp4、语音 silk/mp3/wav/ogg）"
+        )
     name = str(segment.get("hash") or "").strip() or hashlib.sha256(binary).hexdigest()
-    return {"binary": binary, "file_name": f"{name}.{extension}"}
+    return {"binary": binary, "file_name": f"{name}.{extension}", "file_type": file_type}
 
 
-def _detect_image_extension(binary: bytes) -> str:
-    """按文件头识别官方富媒体支持的图片格式，无法识别时返回空串。"""
+def _decode_base64(raw_base64: str, segment_type: str) -> bytes:
+    """解码消息段里的 Base64 内容，失败时给出可读错误。"""
+    try:
+        return base64.b64decode(raw_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError(f"出站{segment_type}段的二进制数据不是有效的 Base64") from None
+
+
+def _file_type_from_name(file_name: str) -> Tuple[str, int]:
+    """按文件名后缀推断官方上传类型，无法判断时返回空扩展名与 0。"""
+    extension = file_name.rsplit(".", 1)[-1].lower().strip() if "." in file_name else ""
+    return extension, MEDIA_FILE_TYPE_BY_EXTENSION.get(extension, 0)
+
+
+def _detect_media_extension(binary: bytes) -> Tuple[str, int]:
+    """按文件头识别官方富媒体支持的格式，返回（扩展名, file_type）；无法识别时为 ("", 0)。"""
     if binary.startswith(b"\xff\xd8\xff"):
-        return "jpg"
+        return "jpg", 1
     if binary.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
+        return "png", 1
     if binary.startswith((b"GIF87a", b"GIF89a")):
-        return "gif"
+        return "gif", 1
     if binary[:4] == b"RIFF" and binary[8:12] == b"WEBP":
-        return "webp"
+        return "webp", 1
     if binary.startswith(b"BM"):
-        return "bmp"
-    return ""
+        return "bmp", 1
+    if binary[4:8] == b"ftyp":
+        return "mp4", 2
+    # QQ/微信语音载荷带 0x02/0x03 前导标记，官方同样接受这种 SILK 流。
+    if binary.startswith((b"#!SILK_V3", b"\x02#!SILK_V3", b"\x03#!SILK_V3")):
+        return "silk", 3
+    if binary[:4] == b"RIFF" and binary[8:12] == b"WAVE":
+        return "wav", 3
+    if binary.startswith(b"OggS"):
+        return "ogg", 3
+    if binary.startswith(b"ID3") or binary[:2] in {b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"}:
+        return "mp3", 3
+    return "", 0
