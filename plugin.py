@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 import asyncio
 import base64
 import json
+import random
 import re
 import time
 
@@ -52,6 +53,8 @@ MUTE_TOOL_NAME = "mute"
 RECALL_TOOL_NAME = "recall_message"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 主动消息没有 msg_id 可依附，平台按 msg_seq 去重；每次发送取一个随机序号避免撞上默认值 1。
+PROACTIVE_MSG_SEQ_RANGE = (1, 10000)
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -1165,9 +1168,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     self.ctx.logger.debug(
                         "QQ 官方出站缺少引用索引，消息不携带 message_reference: target=%s", quote_target
                     )
+                # 有被动凭证就按被动回复发；没有则显式按主动消息发（带 msg_seq、不带 msg_id），
+                # 不再裸发无参请求——省略 msg_seq 会撞上平台默认值 1 而被判重复（40054005）。
                 passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
+                send_fields = passive_fields or self._proactive_fields(scene, route_target)
                 result = await self._api_post(
-                    f"{base_path}/messages", {**body, **reference_fields, **passive_fields}
+                    f"{base_path}/messages", {**body, **reference_fields, **send_fields}
                 )
                 if not result.get("id"):
                     raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
@@ -1235,7 +1241,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
     async def _claim_passive_fields(self, scene: str, route_target: str, reply_to: str) -> Dict[str, Any]:
         """为一次发送占用被动回复序号；无入站上下文或被动窗口已失效时返回空字典。
 
-        省略 msg_id/msg_seq 时由平台按主动消息额度受理，发送是否成功以平台响应为准。
+        返回空字典表示没有可用凭证，调用方需改按主动消息发送（见 _proactive_fields）。
         """
         async with self._reply_lock:
             if reply_to:
@@ -1254,6 +1260,27 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             sequence = used + 1
             self._replies[key] = (received_at, sequence)
             return {"msg_id": key[2], "msg_seq": sequence}
+
+    def _proactive_fields(self, scene: str, route_target: str) -> Dict[str, Any]:
+        """被动回复窗口不可用时，组装一条主动消息的请求字段。
+
+        主动消息不携带 msg_id（没有可依附的入站消息），平台只按 msg_seq 去重，
+        因此这里给每次发送取一个随机序号；用户关闭「允许主动发送」时平台会以
+        40034105 拒绝，超额则以 40034100 拒绝，均按普通发送失败上报。
+        """
+        if not self.config.proactive.enabled:
+            raise RuntimeError(
+                f"QQ 官方被动回复窗口已失效且主动消息已关闭，放弃发送: scene={scene} target={route_target}"
+            )
+        low, high = PROACTIVE_MSG_SEQ_RANGE
+        sequence = random.randint(low, high)
+        self.ctx.logger.info(
+            "QQ 官方被动回复窗口不可用，改按主动消息发送: scene=%s target=%s msg_seq=%s",
+            scene,
+            route_target,
+            sequence,
+        )
+        return {"msg_seq": sequence}
 
     async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
