@@ -27,6 +27,7 @@ from .codec import (
     encode_message,
     extract_command_text,
     extract_message_scene_fields,
+    is_bot_author,
     summarize_payload,
 )
 from .settings import AdapterSettings
@@ -602,6 +603,11 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
     async def _receive_message(self, event: str, data: Mapping[str, Any], *, account_id: str, bot_name: str) -> None:
         try:
+            # 群内可能存在其它官方机器人：它们的消息 author.bot=true，默认直接丢弃，
+            # 避免两个机器人互相触发形成对话回环。命令同样不处理，机器人不应能绑定 ID。
+            if self.config.filter.ignore_other_bots and is_bot_author(data):
+                self.ctx.logger.debug("忽略其它机器人消息: %s | payload=%s", data.get("id"), summarize_payload(data))
+                return
             # 管理命令（/assign_group_id、/assign_id）在解码前拦截，不进入聊天流。
             command = extract_command_text(data)
             if command.split(" ", 1)[0] in ASSIGN_COMMANDS:

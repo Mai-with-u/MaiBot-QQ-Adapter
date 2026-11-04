@@ -37,6 +37,10 @@ enabled = true
 # 留空时允许所有群使用撤回工具，单聊不受群白名单限制。
 allowed_groups = []
 
+[filter]
+# 屏蔽群里其它机器人（含其它官方机器人）的消息，避免机器人之间互相触发。
+ignore_other_bots = true
+
 [advanced]
 # 断线重连间隔（秒）。
 reconnect_delay_sec = 5.0
@@ -87,6 +91,14 @@ QQ 官方平台的 OpenID 与真实 QQ 号不互通。为了让消息以真实 Q
 未填写工具配置或 `allowed_groups` 时，工具默认启用且不限制群；已有配置中显式设置的 `enabled = false` 仍会关闭对应工具。
 
 平台限制：发送超过 2 分钟的消息不可撤回；群聊中机器人是群管理员时可撤回自己与普通群成员的消息，否则只能撤回自己发的消息；单聊只能撤回机器人自己发的消息。
+
+## 消息过滤
+
+群内可能有其它机器人（例如另一个官方机器人）。官方事件体的 `author` 是 User 结构，`author.bot = true` 表示这条消息由机器人发出。配置 `[filter].ignore_other_bots`（默认开启）会直接丢弃这类消息：
+
+- 不进入聊天流、不触发回复，也不会执行 `/assign_id` 等绑定命令；日志只记一条 debug。
+- 判定只看 `author.bot`，字段缺失或为 `false` 时按普通用户处理；`group_message_create`（全量模式）、`group_at_message_create`、`c2c_message_create` 三个事件都有该字段。
+- 关闭后将退回原行为：其它机器人的消息照常进入聊天流。
 
 ## 头像接口
 
