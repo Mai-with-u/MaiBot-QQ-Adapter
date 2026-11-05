@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import md5, sha1, sha256
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Set, Tuple, Type
 from urllib.parse import quote, urlsplit
@@ -18,6 +19,7 @@ from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, Messa
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .codec import (
+    FILE_FILE_TYPE,
     GROUP_EVENTS,
     PLATFORM,
     QQ_FACE_TAG_PATTERN,
@@ -43,6 +45,17 @@ MAX_INBOUND_ATTACHMENTS = 10
 MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
 # 官方预上传要求的 md5_10m：文件前 10002432 字节的 MD5。
 MD5_10M_BYTES = 10002432
+# 官方普通文件单文件上限 200MB；宿主只给出本机转存地址时要自己取回字节再上传。
+MAX_OUTBOUND_MEDIA_BYTES = 200 * 1024 * 1024
+# 分片上传的并发与重试由官方在 upload_prepare 的 upload_config 里下发，这里是缺省兜底值。
+DEFAULT_UPLOAD_CONCURRENCY = 1
+MAX_UPLOAD_CONCURRENCY = 4
+DEFAULT_UPLOAD_RETRY_TIMEOUT = 30.0
+DEFAULT_UPLOAD_RETRY_DELAY = 1.0
+# 富媒体传输必须覆盖会话的 20 秒总超时：分片 PUT 沿用官方文档建议的 300 秒，
+# 本机/内网取回按 socket 空闲 60 秒限流，否则大文件会被总超时提前掐断。
+PART_UPLOAD_TIMEOUT_SEC = 300.0
+LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC = 60.0
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
 TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
@@ -1142,10 +1155,16 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             # reply 段是宿主明确指定的引用目标；没有段时回退到消息级 reply_to。
             quote_target = reply_target_id or reply_to
             base_path = f"/v2/{'groups' if scene == 'group' else 'users'}/{quote(target, safe='')}"
-            # 官方一条消息只承载一种内容，文本与图片按原顺序逐条发送。
+            # 官方一条消息只承载一种内容，文本与富媒体按原顺序逐条发送。
             for index, part in enumerate(parts):
                 if part["kind"] == "media":
-                    file_info = await self._upload_image(base_path, part["binary"], part["file_name"])
+                    file_info = await self._upload_media(
+                        base_path,
+                        part["file_type"],
+                        part["file_name"],
+                        part.get("binary"),
+                        str(part.get("url") or ""),
+                    )
                     body: Dict[str, Any] = {"msg_type": 7, "media": {"file_info": file_info}}
                 else:
                     body = part["body"]
@@ -1255,14 +1274,27 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             self._replies[key] = (received_at, sequence)
             return {"msg_id": key[2], "msg_seq": sequence}
 
-    async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
+    async def _api_post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        timeout: Optional[float] = None,
+    ) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。
+
+        ``timeout`` 只给富媒体上传接口用：预上传要算校验值、合并要服务端拼装完整文件，
+        几十上百 MB 的文件都会超过会话默认的 20 秒总超时。
+        """
         session = self._require_session()
         token = await self._authorize()
+        request_options: Dict[str, Any] = {}
+        if timeout is not None:
+            request_options["timeout"] = ClientTimeout(total=timeout)
         async with session.post(
             self._api_url(path),
             headers={"Authorization": f"QQBot {token}"},
             json=dict(payload),
+            **request_options,
         ) as response:
             text = await response.text()
             try:
@@ -1278,62 +1310,201 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
         return result
 
-    async def _upload_image(self, base_path: str, binary: bytes, file_name: str) -> str:
-        """按官方分片上传流程上传图片，返回用于 msg_type=7 的 file_info。
+    async def _upload_media(
+        self,
+        base_path: str,
+        file_type: int,
+        file_name: str,
+        binary: Optional[bytes] = None,
+        url: str = "",
+    ) -> str:
+        """按官方上传流程取得 file_info，返回用于 msg_type=7 的富媒体信息。
 
-        流程：upload_prepare 取预签名分片 URL → 逐片 PUT 并 upload_part_finish → 携带 upload_id 调用 files 合并。
+        二进制内容走官方推荐的分片上传：upload_prepare 取预签名分片 URL → 逐片 PUT 并
+        upload_part_finish → 携带 upload_id 调用 files 合并；只有公网 URL 时交给平台转存，
+        避免插件自行下载任意地址。file_type 由官方定义：1 图片、2 视频、3 语音、4 普通文件。
         """
+        if binary is None:
+            if not url:
+                raise RuntimeError("QQ 富媒体上传缺少文件内容（二进制或 URL）")
+            if self._is_local_media_url(url):
+                # 宿主的附件转存地址是本机回环地址（files.transfer_base_url 默认取本机
+                # HTTP 地址），平台抓不到，只能自己取回字节后走分片上传。
+                binary = await self._read_local_media(url)
+            else:
+                body: Dict[str, Any] = {"file_type": file_type, "url": url, "srv_send_msg": False}
+                if file_type == FILE_FILE_TYPE:
+                    # 普通文件必须带文件名，否则客户端拿不到可读的文件卡片标题。
+                    body["file_name"] = file_name
+                result = await self._api_post(f"{base_path}/files", body, timeout=PART_UPLOAD_TIMEOUT_SEC)
+                file_info = str(result.get("file_info") or "")
+                if not file_info:
+                    raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
+                return file_info
         prepare = await self._api_post(
             f"{base_path}/upload_prepare",
             {
-                "file_type": 1,
+                "file_type": file_type,
                 "file_size": str(len(binary)),
                 "file_name": file_name,
                 "md5": md5(binary).hexdigest(),
                 "sha1": sha1(binary).hexdigest(),
                 "md5_10m": md5(binary[:MD5_10M_BYTES]).hexdigest(),
             },
+            timeout=PART_UPLOAD_TIMEOUT_SEC,
         )
         upload_id = str(prepare.get("upload_id") or "")
         block_size = int(prepare.get("block_size") or 0)
         upload_parts = prepare.get("parts")
         if not upload_id or block_size <= 0 or not isinstance(upload_parts, list) or not upload_parts:
-            raise RuntimeError("QQ 图片预上传响应缺少 upload_id、block_size 或 parts")
+            raise RuntimeError("QQ 富媒体预上传响应缺少 upload_id、block_size 或 parts")
         # 文档写分片序号从 0 开始，实测（2026-09-30）返回从 1 开始，按实际最小序号计算偏移。
         index_base = min(int(upload_part["index"]) for upload_part in upload_parts)
         if index_base not in (0, 1):
-            raise RuntimeError(f"QQ 图片预上传返回的分片序号起点无效: {index_base}")
+            raise RuntimeError(f"QQ 富媒体预上传返回的分片序号起点无效: {index_base}")
         session = self._require_session()
-        for upload_part in upload_parts:
-            index = int(upload_part["index"])
-            presigned_url = str(upload_part.get("presigned_url") or "")
-            if not presigned_url.startswith("https://"):
-                raise RuntimeError(f"QQ 图片分片 {index} 的预签名地址无效")
-            offset = (index - index_base) * block_size
-            chunk = binary[offset : offset + block_size]
-            if not chunk:
-                raise RuntimeError(f"QQ 图片分片 {index} 超出文件范围")
-            # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头。
-            async with session.put(presigned_url, data=chunk) as response:
-                if response.status >= 400:
-                    raise RuntimeError(f"QQ 图片分片 {index} 上传失败: HTTP {response.status}")
-            await self._api_post(
-                f"{base_path}/upload_part_finish",
-                {
-                    "upload_id": upload_id,
-                    "part_index": index,
-                    "block_size": str(len(chunk)),
-                    "md5": md5(chunk).hexdigest(),
-                },
-            )
+        concurrency, retry_timeout, retry_delay = self._upload_policy(prepare.get("upload_config"))
+        # 官方在 upload_config 里下发并发与重试策略；大文件分片较多时并发能显著缩短上传时间。
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _send_part(upload_part: Mapping[str, Any]) -> None:
+            async with semaphore:
+                await self._upload_one_part(
+                    session,
+                    base_path,
+                    upload_id,
+                    block_size,
+                    index_base,
+                    binary,
+                    upload_part,
+                    retry_timeout,
+                    retry_delay,
+                )
+
+        await asyncio.gather(*(_send_part(upload_part) for upload_part in upload_parts))
         result = await self._api_post(
             f"{base_path}/files",
-            {"file_type": 1, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
+            {"file_type": file_type, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
+            timeout=PART_UPLOAD_TIMEOUT_SEC,
         )
         file_info = str(result.get("file_info") or "")
         if not file_info:
-            raise RuntimeError("QQ 图片上传响应缺少 file_info")
+            raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
         return file_info
+
+    @staticmethod
+    def _upload_policy(upload_config: Any) -> Tuple[int, float, float]:
+        """读取官方下发的 upload_config，返回（并发数, 重试超时, 重试间隔）。"""
+        config = upload_config if isinstance(upload_config, Mapping) else {}
+
+        def _number(key: str, default: float) -> float:
+            raw_value = config.get(key)
+            if raw_value is None:
+                return default
+            try:
+                return float(raw_value)
+            except (TypeError, ValueError):
+                return default
+
+        concurrency = int(_number("concurrency", DEFAULT_UPLOAD_CONCURRENCY))
+        concurrency = max(1, min(concurrency, MAX_UPLOAD_CONCURRENCY))
+        retry_timeout = max(0.0, _number("retry_timeout", DEFAULT_UPLOAD_RETRY_TIMEOUT))
+        retry_delay = max(0.0, _number("retry_delay", DEFAULT_UPLOAD_RETRY_DELAY))
+        return concurrency, retry_timeout, retry_delay
+
+    async def _upload_one_part(
+        self,
+        session: ClientSession,
+        base_path: str,
+        upload_id: str,
+        block_size: int,
+        index_base: int,
+        binary: bytes,
+        upload_part: Mapping[str, Any],
+        retry_timeout: float,
+        retry_delay: float,
+    ) -> None:
+        """上传单个分片并在官方允许的时间窗内重试，失败信息带上分片序号。"""
+        index = int(upload_part["index"])
+        presigned_url = str(upload_part.get("presigned_url") or "")
+        if not presigned_url.startswith("https://"):
+            raise RuntimeError(f"QQ 富媒体分片 {index} 的预签名地址无效")
+        offset = (index - index_base) * block_size
+        chunk = binary[offset : offset + block_size]
+        if not chunk:
+            raise RuntimeError(f"QQ 富媒体分片 {index} 超出文件范围")
+        deadline = time.monotonic() + retry_timeout
+        while True:
+            try:
+                # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头；会话默认的 20 秒总超时
+                # 会让大分片在慢网下被提前掐断，这里按官方建议的单次上传超时覆盖。
+                async with session.put(
+                    presigned_url, data=chunk, timeout=ClientTimeout(total=PART_UPLOAD_TIMEOUT_SEC)
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(f"QQ 富媒体分片 {index} 上传失败: HTTP {response.status}")
+                await self._api_post(
+                    f"{base_path}/upload_part_finish",
+                    {
+                        "upload_id": upload_id,
+                        "part_index": index,
+                        "block_size": str(len(chunk)),
+                        "md5": md5(chunk).hexdigest(),
+                    },
+                )
+                return
+            except (ClientError, TimeoutError):
+                # 只重试网络层失败：平台明确拒绝（4xx/业务错误码）重试也不会有不同结果。
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(retry_delay)
+
+    async def _read_local_media(self, url: str) -> bytes:
+        """取回本机转存地址的富媒体字节，用于自己走分片上传。"""
+        session = self._require_session()
+        try:
+            # 本机转存可能耗时较久（大文件 + 限速），只限制 socket 空闲超时而不是总时长。
+            async with session.get(
+                url, timeout=ClientTimeout(total=None, sock_read=LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC)
+            ) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"宿主附件转存失败: HTTP {response.status}")
+                if response.content_length and response.content_length > MAX_OUTBOUND_MEDIA_BYTES:
+                    raise RuntimeError(
+                        f"出站文件超过 {MAX_OUTBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制"
+                    )
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in response.content.iter_chunked(256 * 1024):
+                    total += len(chunk)
+                    if total > MAX_OUTBOUND_MEDIA_BYTES:
+                        raise RuntimeError(
+                            f"出站文件超过 {MAX_OUTBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except (ClientError, TimeoutError) as exc:
+            raise RuntimeError(f"宿主附件转存失败: {exc}") from exc
+
+    @staticmethod
+    def _is_local_media_url(url: str) -> bool:
+        """判断出站媒体地址是否为本机/内网地址——这类地址平台抓不到，必须自己上传。"""
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            return False
+        if parsed_url.scheme not in {"http", "https"}:
+            return False
+        hostname = (parsed_url.hostname or "").strip().rstrip(".").lower()
+        if not hostname:
+            return False
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return True
+        try:
+            address = ip_address(hostname)
+        except ValueError:
+            return False
+        return address.is_loopback or address.is_private or address.is_link_local
 
 
 def create_plugin() -> QQOfficialAdapterPlugin:
