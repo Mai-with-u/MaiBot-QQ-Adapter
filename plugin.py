@@ -27,6 +27,7 @@ from .codec import (
     encode_message,
     extract_command_text,
     extract_message_scene_fields,
+    parse_command_text,
     summarize_payload,
 )
 from .settings import AdapterSettings
@@ -52,6 +53,9 @@ MUTE_TOOL_NAME = "mute"
 RECALL_TOOL_NAME = "recall_message"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 命令名以该前缀开头但未命中已知命令时，回一条用法提示，避免拼错后静默进入聊天流。
+ASSIGN_COMMAND_PREFIX = "/assign"
+ASSIGN_USAGE_HINT = f"未识别的命令。用法：{ASSIGN_GROUP_COMMAND} <群号> {ASSIGN_USER_COMMAND} <QQ号>"
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -324,20 +328,28 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         sender_ids = {sender_openid, self._id_map["user"].get(sender_openid, "")} - {""}
         return bool(sender_ids & set(self._assign_admin_ids))
 
-    async def _handle_assign_command(self, command: str, event: str, data: Mapping[str, Any]) -> None:
+    async def _handle_assign_command(
+        self,
+        name: str,
+        args: List[str],
+        event: str,
+        data: Mapping[str, Any],
+        command_text: str,
+    ) -> None:
         """处理绑定命令：群/用户 OpenID 绑定到统一 ID；统一账号 ID 只从配置文件读取。
 
-        命令消息不进入聊天流，绑定结果以被动回复回执。
+        命令消息不进入聊天流，绑定结果以被动回复回执。``name``/``args`` 已由
+        :func:`parse_command_text` 归一化，句首 @、全角空格与 `/cmd@Bot` 后缀都不再
+        影响判定；``command_text`` 仅用于从原文里找回 `@someone` 的被绑定对象。
         """
         author = data.get("author")
         author = author if isinstance(author, Mapping) else {}
         sender_openid = self._author_openid(event, author)
-        tokens = QQ_MENTION_TOKEN_PATTERN.sub("", command).split()
-        value = tokens[1] if len(tokens) > 1 else ""
+        value = args[0] if args else ""
         if not self._assign_allowed(sender_openid):
             await self._reply_to_command(event, data, "仅配置的管理员可执行该命令")
             return
-        if command.split(" ", 1)[0] == ASSIGN_GROUP_COMMAND:
+        if name == ASSIGN_GROUP_COMMAND:
             kind = "group"
             openid = str(data.get("group_openid") or "").strip()
             subject = "当前群"
@@ -346,9 +358,14 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 return
         else:
             kind = "user"
-            mention = QQ_MENTION_TOKEN_PATTERN.search(command)
-            if mention is not None and mention.group(1) != self._account_id:
-                openid = mention.group(1)
+            # 归一化会抹掉句首和命令后的 mention，这里直接扫原文，保留「@ 对方为其绑定」的用法。
+            mentioned = [
+                openid
+                for openid in QQ_MENTION_TOKEN_PATTERN.findall(command_text)
+                if openid != self._account_id
+            ]
+            if mentioned:
+                openid = mentioned[0]
                 subject = "被 @ 的用户"
             else:
                 openid = sender_openid
@@ -603,9 +620,15 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
     async def _receive_message(self, event: str, data: Mapping[str, Any], *, account_id: str, bot_name: str) -> None:
         try:
             # 管理命令（/assign_group_id、/assign_id）在解码前拦截，不进入聊天流。
-            command = extract_command_text(data)
-            if command.split(" ", 1)[0] in ASSIGN_COMMANDS:
-                await self._handle_assign_command(command, event, data)
+            # 群聊必须 @ 机器人才能触发，因此命令原文通常带 <@!openid> 或 @昵称 前缀，
+            # 交给 parse_command_text 统一归一化后再比对，避免命令静默穿透进聊天流。
+            command_text = extract_command_text(data)
+            command_name, command_args = parse_command_text(command_text)
+            if command_name in ASSIGN_COMMANDS:
+                await self._handle_assign_command(command_name, command_args, event, data, command_text)
+                return
+            if command_name.startswith(ASSIGN_COMMAND_PREFIX):
+                await self._reply_to_command(event, data, ASSIGN_USAGE_HINT)
                 return
             segments, labels, is_picture, is_emoji = await self._build_attachments(data)
             message, scene, target = decode_message(

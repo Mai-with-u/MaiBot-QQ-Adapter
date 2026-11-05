@@ -19,6 +19,12 @@ SUPPORTED_EVENTS = GROUP_EVENTS | {PRIVATE_EVENT}
 QQ_ATTACHMENT_TAG_PATTERN = re.compile(r"<attachmentType=.*?>", re.IGNORECASE)
 QQ_FACE_TAG_PATTERN = re.compile(r"<faceType=.*?>", re.IGNORECASE)
 QQ_MENTION_TOKEN_PATTERN = re.compile(r"<@!?([0-9A-Za-z_-]+)>")
+# 命令行的空格统一按空白切分：`\s` 已覆盖全角空格（U+3000）与不换行空格（U+00A0）。
+COMMAND_WHITESPACE_PATTERN = re.compile(r"\s+")
+# 句首的 @ 既可能是协议标记 <@!openid>，也可能是客户端渲染出的 @昵称。
+COMMAND_MENTION_PREFIX_PATTERN = re.compile(r"^(?:<@!?[0-9A-Za-z_-]+>|@\S+)\s*")
+# 部分客户端把群内命令写成 `/cmd@Bot`，命令名后紧跟的 @ 后缀不属于命令本身。
+COMMAND_NAME_SUFFIX_PATTERN = re.compile(r"@[0-9A-Za-z_-]+$")
 
 
 def decode_message(
@@ -359,6 +365,30 @@ def extract_command_text(payload: Mapping[str, Any]) -> str:
     """提取消息文本供管理命令解析，<@id> 标记原样保留。"""
 
     return _normalize_content(_extract_content(payload))
+
+
+def parse_command_text(command: str) -> Tuple[str, List[str]]:
+    """把一行管理命令拆成 (命令名, 其余参数)，并抹平各客户端的书写差异。
+
+    群里触发官方机器人必须 @ 它，因此 content 常常以 `<@!openid>` 或渲染后的
+    `@昵称` 开头；中文输入法还会把命令与参数之间的空格输成全角空格。这里先折掉
+    句首 mention、把所有空白（含 U+3000/U+00A0）折叠成半角空格，再去掉命令名后面
+    的 `@Bot` 后缀，最后按空白切分。
+
+    命令名里的连字符统一折成下划线：`/assign-group-id` 与 `/assign_group_id` 等价，
+    这正是官方机器人命令在中文输入法下最常见的误输形态。
+
+    返回的命令名保持原文大小写，由调用方与已知命令集合比对；参数列表不含命令名，
+    也不含单独成词的 `<@id>` 标记（那种 token 是 @ 对象而非参数）。
+    """
+
+    stripped = COMMAND_MENTION_PREFIX_PATTERN.sub("", command.strip())
+    tokens = [token for token in COMMAND_WHITESPACE_PATTERN.split(stripped.strip()) if token]
+    if not tokens:
+        return "", []
+    name = COMMAND_NAME_SUFFIX_PATTERN.sub("", tokens[0]).replace("-", "_")
+    args = [token for token in tokens[1:] if not QQ_MENTION_TOKEN_PATTERN.fullmatch(token)]
+    return name, args
 
 
 def encode_message(
