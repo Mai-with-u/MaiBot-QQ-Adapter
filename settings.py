@@ -65,9 +65,20 @@ class RecallSettings(PluginConfigBase):
     )
 
 
+class ProactiveSettings(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "主动消息"
+    __ui_order__: ClassVar[int] = 4
+
+    enabled: bool = Field(
+        default=True,
+        description="没有可用被动回复凭证时按主动消息发送；关闭后此类发送直接失败",
+        json_schema_extra={"label": "允许主动消息"},
+    )
+
+
 class AdvancedSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "高级设置"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
 
     reconnect_delay_sec: float = Field(
         default=5.0,
@@ -83,4 +94,5 @@ class AdapterSettings(PluginConfigBase):
     qq_official: QQOfficialSettings = Field(default_factory=QQOfficialSettings)
     mute: MuteSettings = Field(default_factory=MuteSettings)
     recall: RecallSettings = Field(default_factory=RecallSettings)
+    proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)
