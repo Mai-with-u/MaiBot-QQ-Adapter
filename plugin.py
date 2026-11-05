@@ -12,6 +12,7 @@ import base64
 import json
 import re
 import time
+import unicodedata
 
 from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
 from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
@@ -62,6 +63,26 @@ PANEL_ITEM_NAME_LIMIT = 14
 PANEL_ITEM_DESC_LIMIT = 30
 GROUP_PANEL_REMARK = "MaiBot-QQ-Adapter"
 PANEL_PAGE_LIMIT = 50
+
+
+def _display_width(text: str) -> int:
+    """按官方口径计算显示宽度：一个中文汉字算 2 个字符，其余算 1 个。"""
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def _truncate_display(text: str, limit: int) -> str:
+    """把文本按官方字符上限截断，避免半个汉字被切坏。"""
+    if _display_width(text) <= limit:
+        return text
+    result: List[str] = []
+    width = 0
+    for char in text:
+        char_width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if width + char_width > limit:
+            break
+        result.append(char)
+        width += char_width
+    return "".join(result)
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -396,14 +417,18 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         """把配置里的单聊菜单项转成官方 /v2/menu 的 Item，跳过信息不完整的项。"""
         items: List[Dict[str, Any]] = []
         for entry in self.config.menu.private_items[:PRIVATE_MENU_MAX_ITEMS]:
-            name = entry.name.strip()[:MENU_ITEM_NAME_LIMIT]
+            name = _truncate_display(entry.name.strip(), MENU_ITEM_NAME_LIMIT)
             if not name:
                 self.ctx.logger.warning("跳过缺少按钮名称的单聊菜单项")
                 continue
             value = entry.value.strip()
             if entry.type == "menu":
                 sub_items = [
-                    {"name": text[:SUB_MENU_ITEM_NAME_LIMIT], "type": "send_message", "send_message": text}
+                    {
+                        "name": _truncate_display(text, SUB_MENU_ITEM_NAME_LIMIT),
+                        "type": "send_message",
+                        "send_message": text,
+                    }
                     for text in (item.strip() for item in entry.sub_items[:PRIVATE_SUB_MENU_MAX_ITEMS])
                     if text
                 ]
@@ -427,13 +452,13 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         """把配置里的群聊面板项转成官方 PanelItem，跳过信息不完整的项。"""
         items: List[Dict[str, Any]] = []
         for entry in self.config.menu.group_items[:GROUP_PANEL_MAX_ITEMS]:
-            name = entry.name.strip()[:PANEL_ITEM_NAME_LIMIT]
+            name = _truncate_display(entry.name.strip(), PANEL_ITEM_NAME_LIMIT)
             if not name:
                 self.ctx.logger.warning("跳过缺少指令文本的群聊面板项")
                 continue
             item: Dict[str, Any] = {
                 "name": name,
-                "desc": entry.description.strip()[:PANEL_ITEM_DESC_LIMIT],
+                "desc": _truncate_display(entry.description.strip(), PANEL_ITEM_DESC_LIMIT),
                 "type": entry.type,
                 "only_admin": bool(entry.only_admin),
             }

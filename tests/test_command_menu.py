@@ -267,6 +267,27 @@ def test_config_schema_exposes_item_limits_to_frontend():
     ]
 
 
+@pytest.mark.asyncio
+async def test_names_are_truncated_by_display_width():
+    """官方按「中文算 2 个字符」计长度，截断不能按字符数算，也不能切坏汉字。"""
+    plugin, stub = _make_plugin(
+        {
+            "private_enabled": True,
+            "private_items": [{"name": "查看帮助文档详情", "value": "/help"}],
+            "group_enabled": True,
+            "group_items": [{"name": "/查看帮助文档详情", "description": "这是一段用于测试截断的指令描述文本"}],
+        }
+    )
+    await plugin._sync_menus(force=True)
+    private_items = stub.payload_of("PUT", "/v2/menu")["menu"]["items"]
+    # 「查看帮助文」= 5 个汉字 = 10 个字符，再放一个汉字就 12，超限
+    assert private_items[0]["name"] == "查看帮助文"
+
+    panel = stub.payload_of("POST", "/v2/panels")["panel"]
+    assert panel["items"][0]["name"] == "/查看帮助文档"  # 1 + 12 = 13，再加就 15
+    assert panel["items"][0]["desc"] == "这是一段用于测试截断的指令描述"  # 30/2 = 15 个汉字
+
+
 def test_over_limit_items_do_not_break_config_validation():
     plugin = QQOfficialAdapterPlugin()
     plugin.set_plugin_config(
