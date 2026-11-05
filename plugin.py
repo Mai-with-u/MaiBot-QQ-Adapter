@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import md5, sha1, sha256
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Set, Tuple, Type
 from urllib.parse import quote, urlsplit
@@ -44,6 +45,8 @@ MAX_INBOUND_ATTACHMENTS = 10
 MAX_INBOUND_MEDIA_BYTES = 20 * 1024 * 1024
 # 官方预上传要求的 md5_10m：文件前 10002432 字节的 MD5。
 MD5_10M_BYTES = 10002432
+# 官方普通文件单文件上限 200MB；宿主只给出本机转存地址时要自己取回字节再上传。
+MAX_OUTBOUND_MEDIA_BYTES = 200 * 1024 * 1024
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
 TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
@@ -1296,21 +1299,26 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         """按官方上传流程取得 file_info，返回用于 msg_type=7 的富媒体信息。
 
         二进制内容走官方推荐的分片上传：upload_prepare 取预签名分片 URL → 逐片 PUT 并
-        upload_part_finish → 携带 upload_id 调用 files 合并；只有 URL 时交给平台转存，
+        upload_part_finish → 携带 upload_id 调用 files 合并；只有公网 URL 时交给平台转存，
         避免插件自行下载任意地址。file_type 由官方定义：1 图片、2 视频、3 语音、4 普通文件。
         """
         if binary is None:
             if not url:
                 raise RuntimeError("QQ 富媒体上传缺少文件内容（二进制或 URL）")
-            body: Dict[str, Any] = {"file_type": file_type, "url": url, "srv_send_msg": False}
-            if file_type == FILE_FILE_TYPE:
-                # 普通文件必须带文件名，否则客户端拿不到可读的文件卡片标题。
-                body["file_name"] = file_name
-            result = await self._api_post(f"{base_path}/files", body)
-            file_info = str(result.get("file_info") or "")
-            if not file_info:
-                raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
-            return file_info
+            if self._is_local_media_url(url):
+                # 宿主的附件转存地址是本机回环地址（files.transfer_base_url 默认取本机
+                # HTTP 地址），平台抓不到，只能自己取回字节后走分片上传。
+                binary = await self._read_local_media(url)
+            else:
+                body: Dict[str, Any] = {"file_type": file_type, "url": url, "srv_send_msg": False}
+                if file_type == FILE_FILE_TYPE:
+                    # 普通文件必须带文件名，否则客户端拿不到可读的文件卡片标题。
+                    body["file_name"] = file_name
+                result = await self._api_post(f"{base_path}/files", body)
+                file_info = str(result.get("file_info") or "")
+                if not file_info:
+                    raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
+                return file_info
         prepare = await self._api_post(
             f"{base_path}/upload_prepare",
             {
@@ -1362,6 +1370,50 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         if not file_info:
             raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
         return file_info
+
+    async def _read_local_media(self, url: str) -> bytes:
+        """取回本机转存地址的富媒体字节，用于自己走分片上传。"""
+        session = self._require_session()
+        try:
+            async with session.get(url) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"宿主附件转存失败: HTTP {response.status}")
+                if response.content_length and response.content_length > MAX_OUTBOUND_MEDIA_BYTES:
+                    raise RuntimeError(
+                        f"出站文件超过 {MAX_OUTBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制"
+                    )
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in response.content.iter_chunked(256 * 1024):
+                    total += len(chunk)
+                    if total > MAX_OUTBOUND_MEDIA_BYTES:
+                        raise RuntimeError(
+                            f"出站文件超过 {MAX_OUTBOUND_MEDIA_BYTES // 1024 // 1024} MiB 限制"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except (ClientError, TimeoutError) as exc:
+            raise RuntimeError(f"宿主附件转存失败: {exc}") from exc
+
+    @staticmethod
+    def _is_local_media_url(url: str) -> bool:
+        """判断出站媒体地址是否为本机/内网地址——这类地址平台抓不到，必须自己上传。"""
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            return False
+        if parsed_url.scheme not in {"http", "https"}:
+            return False
+        hostname = (parsed_url.hostname or "").strip().rstrip(".").lower()
+        if not hostname:
+            return False
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return True
+        try:
+            address = ip_address(hostname)
+        except ValueError:
+            return False
+        return address.is_loopback or address.is_private or address.is_link_local
 
 
 def create_plugin() -> QQOfficialAdapterPlugin:

@@ -41,20 +41,48 @@ class _FakePut:
         return False
 
 
-class _FakeSession:
-    """只实现分片上传用到的 put；预签名地址不得携带鉴权头。"""
+class _FakeContent:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
 
-    def __init__(self, status: int = 200) -> None:
+    async def iter_chunked(self, size: int):
+        for offset in range(0, len(self._body), size):
+            yield self._body[offset : offset + size]
+
+
+class _FakeGet:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self.content_length = len(body)
+        self.content = _FakeContent(body)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FakeSession:
+    """只实现富媒体上传用到的 put 与本机转存取数用到的 get；预签名地址不得携带鉴权头。"""
+
+    def __init__(self, status: int = 200, local_body: bytes = b"") -> None:
         self.status = status
         self.closed = False
         self.puts = []
+        self.local_body = local_body
+        self.gets = []
 
     def put(self, url, **kwargs):
         self.puts.append((url, kwargs))
         return _FakePut(self.status)
 
+    def get(self, url, **kwargs):
+        self.gets.append((url, kwargs))
+        return _FakeGet(self.status, self.local_body)
 
-async def _make_plugin(parts=None, status: int = 200):
+
+async def _make_plugin(parts=None, status: int = 200, local_body: bytes = b"", block_size: int = 0):
     """构造绕过 SDK 初始化的插件，捕获 _api_post 与分片 PUT。"""
     plugin = QQOfficialAdapterPlugin.__new__(QQOfficialAdapterPlugin)
     plugin._ready = True
@@ -64,17 +92,18 @@ async def _make_plugin(parts=None, status: int = 200):
     plugin._reply_lock = asyncio.Lock()
     plugin._ctx = _Ctx()
     plugin._replies[("group", GROUP_OPENID, REPLY_ID)] = (time.time(), 0)
-    session = _FakeSession(status=status)
+    session = _FakeSession(status=status, local_body=local_body)
     plugin._session = session
     captured = []
     upload_parts = parts if parts is not None else [{"index": 1, "presigned_url": "https://upload.example/1"}]
+    fake_block_size = block_size or len(PNG)
 
     async def _fake_api_post(path, payload):
         captured.append((path, dict(payload)))
         if path.endswith("/upload_prepare"):
             return {
                 "upload_id": "UPLOAD1",
-                "block_size": str(len(PNG)),
+                "block_size": str(fake_block_size),
                 "parts": upload_parts,
             }
         if path.endswith("/upload_part_finish"):
@@ -277,3 +306,58 @@ async def test_unrecognized_media_payload_reports_error() -> None:
     assert result["success"] is False
     assert "不是官方支持的媒体格式" in result["error"]
     assert not [path for path, _ in captured if path.endswith("/messages")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8001/api/files/transfers/token1",
+        "http://localhost:8001/api/files/transfers/token1",
+        "http://192.168.1.20:8001/api/files/transfers/token1",
+        "http://[::1]:8001/api/files/transfers/token1",
+    ],
+)
+async def test_local_transfer_url_is_downloaded_and_uploaded_in_parts(url) -> None:
+    # 宿主的附件转存地址默认是本机回环地址，平台抓不到，必须自己取回字节再分片上传。
+    pdf = b"%PDF-1.7 local report"
+    plugin, captured, session = await _make_plugin(local_body=pdf, block_size=1024)
+    message = _media_message({"type": "file", "data": {"name": "report.pdf", "url": url}})
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    assert [requested for requested, _ in session.gets] == [url]
+    files_payload = _post_payload(captured, "/files")
+    assert files_payload["file_type"] == 4
+    assert files_payload["file_name"] == "report.pdf"
+    # 走的是分片合并路径，不能把本机地址交给平台转存。
+    assert "url" not in files_payload
+    assert files_payload["upload_id"] == "UPLOAD1"
+    assert _post_payload(captured, "/upload_prepare")["file_size"] == str(len(pdf))
+    assert session.puts[0][1]["data"] == pdf
+
+
+@pytest.mark.asyncio
+async def test_public_url_is_still_transferred_by_platform() -> None:
+    # 公网地址仍交给平台转存，避免插件替任意地址做下载代理。
+    plugin, captured, session = await _make_plugin()
+    message = _media_message(
+        {"type": "file", "data": {"name": "report.pdf", "url": "http://example.com/report.pdf"}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    assert session.gets == []
+    assert not [path for path, _ in captured if path.endswith("/upload_prepare")]
+    assert _post_payload(captured, "/files")["url"] == "http://example.com/report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_local_transfer_download_failure_reports_error() -> None:
+    # 取回本机附件失败时要给出可读错误，且不发起任何 QQ 接口调用。
+    plugin, captured, _ = await _make_plugin(status=500, local_body=b"")
+    message = _media_message(
+        {"type": "file", "data": {"name": "report.pdf", "url": "http://127.0.0.1:8001/api/files/transfers/t1"}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is False
+    assert "宿主附件转存失败: HTTP 500" in result["error"]
+    assert captured == []
