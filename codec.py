@@ -515,11 +515,12 @@ def _decode_media_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
         binary = _decode_base64(raw_base64, segment_type)
         extension, file_type = _detect_media_extension(binary)
         if not file_type:
-            # 识别不出富媒体类型时按普通文件（file_type=4）发送，并保留宿主的真实后缀，
-            # 否则客户端文件卡片的类型与名称都会失真。
-            name_extension, name_file_type = _file_type_from_name(file_name)
-            file_type = name_file_type or FILE_FILE_TYPE
-            extension = name_extension or extension or "bin"
+            # 内容识别不出富媒体类型时一律按普通文件（file_type=4）发送：此时若照着扩展名
+            # 硬按图片/视频/语音上传，平台会以 850019 直接拒绝，反而发不出去。后缀只用来
+            # 让客户端的文件卡片显示真实名称。
+            name_extension, _ = _file_type_from_name(file_name)
+            file_type = FILE_FILE_TYPE
+            extension = name_extension or "bin"
         return {
             "binary": binary,
             "file_name": file_name or f"{hashlib.sha256(binary).hexdigest()}.{extension}",

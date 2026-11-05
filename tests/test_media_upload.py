@@ -253,6 +253,20 @@ async def test_file_segment_without_extension_defaults_to_plain_file() -> None:
 
 
 @pytest.mark.asyncio
+async def test_file_segment_trusts_content_over_extension() -> None:
+    # 文件名写着 mp4 但内容不是 mp4：按内容判定为普通文件，避免平台以 850019 拒绝上传。
+    plugin, captured, _ = await _make_plugin()
+    message = _media_message(
+        {"type": "file", "data": {"name": "fake.mp4", "base64": base64.b64encode(b"%PDF-1.7 x").decode()}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    prepare = _post_payload(captured, "/upload_prepare")
+    assert prepare["file_type"] == 4
+    assert prepare["file_name"] == "fake.mp4"
+
+
+@pytest.mark.asyncio
 async def test_unrecognized_media_payload_reports_error() -> None:
     # 段声明是 video 但内容不是 mp4：按文件头识别失败，报官方支持格式。
     plugin, captured, _ = await _make_plugin()
