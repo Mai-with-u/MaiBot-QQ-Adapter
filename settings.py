@@ -81,12 +81,12 @@ class PrivateMenuItem(PluginConfigBase):
     value: str = Field(
         default="",
         description="按钮类型为「填入指令」时填点击后填入输入框的内容（如 /help）；为「跳转链接」时填以 https:// 开头的地址",
-        json_schema_extra={"label": "按钮内容"},
+        json_schema_extra={"label": "按钮内容（指令或 https 链接）"},
     )
     sub_items: List[str] = Field(
         default_factory=list,
         description="仅「二级菜单」类型生效，最多 5 项，每项为点击后填入输入框的指令；二级菜单不支持再嵌套",
-        json_schema_extra={"label": "二级菜单项"},
+        json_schema_extra={"label": "二级菜单项（仅「二级菜单」类型）", "max_items": 5},
     )
 
 
@@ -111,9 +111,13 @@ class GroupMenuItem(PluginConfigBase):
     link: str = Field(
         default="",
         description="仅「跳转链接」类型生效，必须以 https:// 开头",
-        json_schema_extra={"label": "跳转链接"},
+        json_schema_extra={"label": "跳转链接（仅「跳转链接」类型）"},
     )
-    only_admin: bool = Field(default=False, description="是否仅群管理员可点击")
+    only_admin: bool = Field(
+        default=False,
+        description="仅群管理员可点击该项",
+        json_schema_extra={"label": "仅群管理员可见"},
+    )
 
 
 class MenuSettings(PluginConfigBase):
@@ -127,9 +131,8 @@ class MenuSettings(PluginConfigBase):
     )
     private_items: List[PrivateMenuItem] = Field(
         default_factory=list,
-        max_length=10,
         description="单聊自定义菜单项，最多 10 项；留空表示清空平台现有菜单",
-        json_schema_extra={"label": "单聊菜单项"},
+        json_schema_extra={"label": "单聊菜单项", "max_items": 10},
     )
     group_enabled: bool = Field(
         default=False,
@@ -138,9 +141,8 @@ class MenuSettings(PluginConfigBase):
     )
     group_items: List[GroupMenuItem] = Field(
         default_factory=list,
-        max_length=20,
         description="群聊指令面板项，最多 20 项；留空表示删除适配器创建的全局面板",
-        json_schema_extra={"label": "群聊面板项"},
+        json_schema_extra={"label": "群聊面板项", "max_items": 20},
     )
 
 

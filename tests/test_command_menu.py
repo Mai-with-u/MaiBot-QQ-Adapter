@@ -241,3 +241,48 @@ async def test_config_widget_state_covers_menu_widgets():
     snapshot = ConfigWidgetSnapshot(widgets=plugin.config_widgets, states=states)
     assert "menu" in snapshot.states
     assert states["menu_sync"].disabled
+
+
+def test_config_schema_exposes_item_limits_to_frontend():
+    from maibot_sdk.config import generate_plugin_config_schema
+
+    from qq_official_adapter.settings import AdapterSettings
+
+    schema = generate_plugin_config_schema(
+        AdapterSettings,
+        plugin_id="Mai-with-u.qq-adapter",
+        plugin_name="QQ 官方机器人适配器",
+        plugin_version="0.5.0",
+        plugin_description="",
+        plugin_author="",
+    )
+    fields = schema["sections"]["menu"]["fields"]
+    assert fields["private_items"]["item_type"] == "object"
+    assert fields["private_items"]["max_items"] == 10
+    assert fields["group_items"]["max_items"] == 20
+    assert fields["private_items"]["item_fields"]["type"]["choices"] == [
+        "send_message",
+        "link",
+        "menu",
+    ]
+
+
+def test_over_limit_items_do_not_break_config_validation():
+    plugin = QQOfficialAdapterPlugin()
+    plugin.set_plugin_config(
+        plugin.get_default_config()
+        | {
+            "menu": {
+                "private_enabled": True,
+                "private_items": [
+                    {"name": f"项{index}", "value": f"/c{index}"} for index in range(11)
+                ],
+                "group_enabled": True,
+                "group_items": [{"name": f"/g{index}"} for index in range(21)],
+            }
+        }
+    )
+    # 超出上限由下发时截断兜底，配置本身不能校验失败（否则整份配置报废）
+    assert len(plugin.config.menu.private_items) == 11
+    assert len(plugin._build_private_menu_items()) == 10
+    assert len(plugin._build_group_panel_items()) == 20
