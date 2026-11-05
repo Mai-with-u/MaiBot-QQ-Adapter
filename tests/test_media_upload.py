@@ -3,6 +3,7 @@ import base64
 import time
 
 import pytest
+from aiohttp import ClientConnectionError
 
 from qq_official_adapter.plugin import QQOfficialAdapterPlugin
 
@@ -31,13 +32,21 @@ class _Ctx:
 
 
 class _FakePut:
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, session=None) -> None:
         self.status = status
+        self._session = session
 
     async def __aenter__(self):
+        if self._session is not None:
+            self._session.in_flight += 1
+            self._session.max_in_flight = max(self._session.max_in_flight, self._session.in_flight)
+            # 让出事件循环，使并发上传的分片能真正重叠，用于断言并发度。
+            await asyncio.sleep(0)
         return self
 
     async def __aexit__(self, *exc_info):
+        if self._session is not None:
+            self._session.in_flight -= 1
         return False
 
 
@@ -66,23 +75,37 @@ class _FakeGet:
 class _FakeSession:
     """只实现富媒体上传用到的 put 与本机转存取数用到的 get；预签名地址不得携带鉴权头。"""
 
-    def __init__(self, status: int = 200, local_body: bytes = b"") -> None:
+    def __init__(self, status: int = 200, local_body: bytes = b"", put_failures: int = 0) -> None:
         self.status = status
         self.closed = False
         self.puts = []
         self.local_body = local_body
         self.gets = []
+        # 前若干次 PUT 抛网络异常，用于验证按官方 upload_config 下发的策略重试。
+        self.put_failures = put_failures
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def put(self, url, **kwargs):
         self.puts.append((url, kwargs))
-        return _FakePut(self.status)
+        if self.put_failures > 0:
+            self.put_failures -= 1
+            raise ClientConnectionError("connection reset")
+        return _FakePut(self.status, self)
 
     def get(self, url, **kwargs):
         self.gets.append((url, kwargs))
         return _FakeGet(self.status, self.local_body)
 
 
-async def _make_plugin(parts=None, status: int = 200, local_body: bytes = b"", block_size: int = 0):
+async def _make_plugin(
+    parts=None,
+    status: int = 200,
+    local_body: bytes = b"",
+    block_size: int = 0,
+    upload_config=None,
+    put_failures: int = 0,
+):
     """构造绕过 SDK 初始化的插件，捕获 _api_post 与分片 PUT。"""
     plugin = QQOfficialAdapterPlugin.__new__(QQOfficialAdapterPlugin)
     plugin._ready = True
@@ -92,7 +115,7 @@ async def _make_plugin(parts=None, status: int = 200, local_body: bytes = b"", b
     plugin._reply_lock = asyncio.Lock()
     plugin._ctx = _Ctx()
     plugin._replies[("group", GROUP_OPENID, REPLY_ID)] = (time.time(), 0)
-    session = _FakeSession(status=status, local_body=local_body)
+    session = _FakeSession(status=status, local_body=local_body, put_failures=put_failures)
     plugin._session = session
     captured = []
     upload_parts = parts if parts is not None else [{"index": 1, "presigned_url": "https://upload.example/1"}]
@@ -101,11 +124,14 @@ async def _make_plugin(parts=None, status: int = 200, local_body: bytes = b"", b
     async def _fake_api_post(path, payload):
         captured.append((path, dict(payload)))
         if path.endswith("/upload_prepare"):
-            return {
+            prepare = {
                 "upload_id": "UPLOAD1",
                 "block_size": str(fake_block_size),
                 "parts": upload_parts,
             }
+            if upload_config is not None:
+                prepare["upload_config"] = upload_config
+            return prepare
         if path.endswith("/upload_part_finish"):
             return {}
         if path.endswith("/files"):
@@ -361,3 +387,59 @@ async def test_local_transfer_download_failure_reports_error() -> None:
     assert result["success"] is False
     assert "宿主附件转存失败: HTTP 500" in result["error"]
     assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_parts_uploaded_concurrently_per_upload_config() -> None:
+    # 官方在 upload_config 里下发 concurrency；分片应按该并发度并行上传而不是串行。
+    parts = [
+        {"index": 1, "presigned_url": "https://upload.example/1"},
+        {"index": 2, "presigned_url": "https://upload.example/2"},
+        {"index": 3, "presigned_url": "https://upload.example/3"},
+    ]
+    plugin, captured, session = await _make_plugin(
+        parts=parts, block_size=8, upload_config={"concurrency": 3}
+    )
+    message = _media_message(
+        {"type": "image", "data": "", "binary_data_base64": base64.b64encode(PNG + PNG + PNG).decode()}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    assert len(session.puts) == 3
+    # 三个分片同时进入 PUT，说明受 upload_config.concurrency 控制而非串行。
+    assert session.max_in_flight == 3
+
+
+@pytest.mark.asyncio
+async def test_upload_concurrency_is_capped() -> None:
+    # 平台若下发超出上限的并发度，按本地上限收敛，避免同时打开过多连接。
+    parts = [
+        {"index": index, "presigned_url": f"https://upload.example/{index}"} for index in range(1, 7)
+    ]
+    plugin, captured, session = await _make_plugin(
+        parts=parts, block_size=8, upload_config={"concurrency": 99}
+    )
+    message = _media_message(
+        {"type": "image", "data": "", "binary_data_base64": base64.b64encode(PNG * 6).decode()}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    assert len(session.puts) == 6
+    # 6 个分片并发提交，实际同时在途的数量被压到 4。
+    assert session.max_in_flight == 4
+
+
+@pytest.mark.asyncio
+async def test_part_put_retries_on_network_error() -> None:
+    # 分片 PUT 遇到网络错误（非平台拒绝）时按重试策略重试，最终成功。
+    plugin, captured, session = await _make_plugin(
+        put_failures=1, upload_config={"retry_timeout": 5, "retry_delay": 0}
+    )
+    message = _media_message(
+        {"type": "image", "data": "", "binary_data_base64": base64.b64encode(PNG).decode()}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    # 第一次抛连接错误，重试后成功落片。
+    assert len(session.puts) == 2
+    assert _post_payload(captured, "/messages")["media"]["file_info"] == FILE_INFO
