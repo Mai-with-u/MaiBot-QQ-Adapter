@@ -202,16 +202,54 @@ async def test_file_segment_without_content_reports_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsupported_file_format_reports_error() -> None:
-    # 官方未开放文件出站（file_type=4），无法识别为图片/视频/语音时给出可读错误。
-    plugin, captured, _ = await _make_plugin()
+async def test_file_segment_with_base64_is_sent_as_plain_file() -> None:
+    # 普通文件（pdf/doc/zip…）走 file_type=4 分片上传，官方 SDK 的 sendFile 也是这条路。
+    plugin, captured, session = await _make_plugin()
+    pdf = b"%PDF-1.7 report"
+    message = _media_message(
+        {"type": "file", "data": {"name": "report.pdf", "base64": base64.b64encode(pdf).decode()}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    assert _post_payload(captured, "/upload_prepare")["file_type"] == 4
+    assert _post_payload(captured, "/files")["file_type"] == 4
+    # 文件名必须原样带出去，否则文件卡片显示不出真实类型。
+    assert _post_payload(captured, "/upload_prepare")["file_name"] == "report.pdf"
+    assert len(session.puts) == 1
+    payload = _post_payload(captured, "/messages")
+    assert payload["msg_type"] == 7
+    assert payload["media"]["file_info"] == FILE_INFO
+
+
+@pytest.mark.asyncio
+async def test_file_segment_with_url_keeps_file_name_for_plain_file() -> None:
+    # 普通文件走 URL 转存时必须带 file_name，平台靠它生成文件卡片标题。
+    plugin, captured, session = await _make_plugin()
     message = _media_message(
         {"type": "file", "data": {"name": "report.pdf", "url": "https://example.com/report.pdf"}}
     )
     result = await plugin.handle_qq_official_gateway(message)
-    assert result["success"] is False
-    assert "暂不支持发送该格式的文件" in result["error"]
-    assert not [path for path, _ in captured if path.endswith("/messages")]
+    assert result["success"] is True
+    assert not [path for path, _ in captured if path.endswith("/upload_prepare")]
+    assert session.puts == []
+    files_payload = _post_payload(captured, "/files")
+    assert files_payload["file_type"] == 4
+    assert files_payload["file_name"] == "report.pdf"
+    assert files_payload["url"] == "https://example.com/report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_file_segment_without_extension_defaults_to_plain_file() -> None:
+    # 既无后缀也识别不出内容时仍按普通文件发送，扩展名退化为 bin 而不是直接失败。
+    plugin, captured, _ = await _make_plugin()
+    message = _media_message(
+        {"type": "file", "data": {"base64": base64.b64encode(b"unknown-bytes").decode()}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    prepare = _post_payload(captured, "/upload_prepare")
+    assert prepare["file_type"] == 4
+    assert prepare["file_name"].endswith(".bin")
 
 
 @pytest.mark.asyncio

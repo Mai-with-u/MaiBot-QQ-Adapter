@@ -20,21 +20,30 @@ QQ_ATTACHMENT_TAG_PATTERN = re.compile(r"<attachmentType=.*?>", re.IGNORECASE)
 QQ_FACE_TAG_PATTERN = re.compile(r"<faceType=.*?>", re.IGNORECASE)
 QQ_MENTION_TOKEN_PATTERN = re.compile(r"<@!?([0-9A-Za-z_-]+)>")
 
-# 官方富媒体按 file_type 区分上传类型：1 图片、2 视频、3 语音（4 文件暂未开放发送）。
+# 官方富媒体按 file_type 区分上传类型：1 图片、2 视频、3 语音、4 普通文件。
+# 官方 rich-media 文档把 4 标注为「暂未开放」，但平台实际受理，官方 SDK
+# （@tencent-connect/qqbot-nodejs 的 sendFile）也是用 file_type=4 上传发送的，
+# 因此这里把它作为 file 段的兜底类型，任意格式文件都能发出去。
+IMAGE_FILE_TYPE = 1
+VIDEO_FILE_TYPE = 2
+VOICE_FILE_TYPE = 3
+FILE_FILE_TYPE = 4
+# 能被官方按富媒体（图片/视频/语音）呈现的后缀；不在表内的走 FILE_FILE_TYPE。
 # 可发送的格式以官方文档为准：图片 jpg/png/gif/webp/bmp、视频 mp4、语音 silk/mp3/wav/ogg。
 MEDIA_FILE_TYPE_BY_EXTENSION = {
-    "jpg": 1,
-    "png": 1,
-    "gif": 1,
-    "webp": 1,
-    "bmp": 1,
-    "mp4": 2,
-    "silk": 3,
-    "mp3": 3,
-    "wav": 3,
-    "ogg": 3,
+    "jpg": IMAGE_FILE_TYPE,
+    "jpeg": IMAGE_FILE_TYPE,
+    "png": IMAGE_FILE_TYPE,
+    "gif": IMAGE_FILE_TYPE,
+    "webp": IMAGE_FILE_TYPE,
+    "bmp": IMAGE_FILE_TYPE,
+    "mp4": VIDEO_FILE_TYPE,
+    "silk": VOICE_FILE_TYPE,
+    "mp3": VOICE_FILE_TYPE,
+    "wav": VOICE_FILE_TYPE,
+    "ogg": VOICE_FILE_TYPE,
 }
-# 这些消息段都可以走富媒体通道；file 段仅在其内容被识别为视频/语音时才走富媒体。
+# 这些消息段都可以走富媒体通道；file 段按文件内容决定按富媒体还是普通文件上传。
 MEDIA_SEGMENT_TYPES = frozenset({"image", "emoji", "video", "voice"})
 
 
@@ -390,9 +399,11 @@ def encode_message(
     官方一条消息只能承载一种内容，因此：
     - 连续的文本/@ 段合并为一个 ``{"kind": "body", "body": {...}}``，含 @ 时以 markdown
       （msg_type=2）发送，否则为纯文本（msg_type=0）；
-    - 每个图片/表情/视频/语音段单独成为一个
-      ``{"kind": "media", "binary": bytes, "file_name": str, "file_type": int}``，
-      由插件按官方分片上传取得 file_info 后以富媒体（msg_type=7）发送。
+    - 每个图片/表情/视频/语音/文件段单独成为一个
+      ``{"kind": "media", "binary": bytes, "file_name": str, "file_type": int}``（只有 URL
+      的文件段为 ``{"kind": "media", "url": str, ...}``），由插件按官方上传流程取得
+      file_info 后以富媒体（msg_type=7）发送；file 段识别不出富媒体类型时按普通文件
+      （file_type=4）发送。
 
     返回的第四项为 reply 段指向的被回复消息 ID（平台消息 id，非 REFIDX），
     由调用方转换为官方 message_reference；无 reply 段时为空串。
@@ -463,14 +474,15 @@ def encode_message(
                 parts.append(f"@{at_nickname} ")
             continue
         if segment.get("type") in MEDIA_SEGMENT_TYPES or segment.get("type") == "file":
-            # file 段只有内容能识别为视频/语音时才可发送，其余文件类型官方未开放，
-            # 由 _decode_media_segment 抛出可读错误。
+            # file 段先按内容猜富媒体类型，猜不出就按普通文件（file_type=4）发送。
             media = _decode_media_segment(segment)
             _flush_text()
             outbound.append({"kind": "media", **media})
             continue
         if segment.get("type") != "text":
-            raise ValueError(f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片、表情、视频与语音")
+            raise ValueError(
+                f"出站暂不支持 {segment.get('type')} 消息段，仅支持文本、@、图片、表情、视频、语音与文件"
+            )
         data = segment.get("data")
         if not isinstance(data, str):
             raise ValueError("出站文本段的数据必须是字符串")
@@ -484,9 +496,10 @@ def encode_message(
 def _decode_media_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
     """取出一个待上传的富媒体段：二进制内容（或可转存的 URL）与官方上传类型。
 
-    图片、表情、视频、语音段直接携带 ``binary_data_base64``；``file`` 段的数据是宿主的
-    FileComponent 负载，可能带 base64 内容，也可能只带可下载 URL——此时不做本地下载，
-    把 URL 交给官方转存，避免插件自行抓取任意地址。
+    图片、表情、视频、语音段直接携带 ``binary_data_base64``，类型由内容决定；``file``
+    段的数据是宿主的 FileComponent 负载，可能带 base64 内容，也可能只带可下载 URL——
+    此时不做本地下载，把 URL 交给官方转存，避免插件自行抓取任意地址。file 段能识别成
+    图片/视频/语音时按对应类型发送，其余格式按普通文件（file_type=4）发送。
     """
     segment_type = str(segment.get("type") or "")
     if segment_type == "file":
@@ -498,16 +511,20 @@ def _decode_media_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
             url = str(file_data.get("url") or "").strip()
             if not url:
                 raise ValueError("出站 file 段缺少文件内容（base64 或 url），无法发送")
-            extension, file_type = _file_type_from_name(file_name or url)
-            if not file_type:
-                # 官方仅支持发送图片、视频、语音三类富媒体，其余文件类型未开放。
-                raise ValueError(f"出站 file 段暂不支持发送该格式的文件: {file_name or url}")
-            return {"url": url, "file_name": file_name or f"file.{extension}", "file_type": file_type}
+            return _build_url_file(file_name, url)
         binary = _decode_base64(raw_base64, segment_type)
         extension, file_type = _detect_media_extension(binary)
         if not file_type:
-            raise ValueError(f"出站 file 段暂不支持发送该格式的文件: {file_name or f'{len(binary)} 字节'}")
-        return {"binary": binary, "file_name": file_name or f"{hashlib.sha256(binary).hexdigest()}.{extension}", "file_type": file_type}
+            # 识别不出富媒体类型时按普通文件（file_type=4）发送，并保留宿主的真实后缀，
+            # 否则客户端文件卡片的类型与名称都会失真。
+            name_extension, name_file_type = _file_type_from_name(file_name)
+            file_type = name_file_type or FILE_FILE_TYPE
+            extension = name_extension or extension or "bin"
+        return {
+            "binary": binary,
+            "file_name": file_name or f"{hashlib.sha256(binary).hexdigest()}.{extension}",
+            "file_type": file_type,
+        }
     raw_base64 = str(segment.get("binary_data_base64") or "").strip()
     if not raw_base64:
         raise ValueError(f"出站{segment_type}段缺少二进制数据，无法作为富媒体发送")
@@ -522,6 +539,27 @@ def _decode_media_segment(segment: Mapping[str, Any]) -> Dict[str, Any]:
     return {"binary": binary, "file_name": f"{name}.{extension}", "file_type": file_type}
 
 
+def _build_url_file(file_name: str, url: str) -> Dict[str, Any]:
+    """把只带 URL 的 file 段整理成官方转存请求需要的字段。
+
+    官方按 file_type=4 上传时会用 file_name 决定文件卡片的展示名，因此名字必须带上
+    真实扩展名；名字缺失或没有后缀时从 URL 里取。
+    """
+    extension, file_type = _file_type_from_name(file_name)
+    if not file_type:
+        url_extension, url_file_type = _file_type_from_name(url)
+        extension = extension or url_extension
+        file_type = url_file_type
+    if not file_name:
+        name = f"file.{extension or 'bin'}"
+    elif "." in file_name.split("?", 1)[0].split("#", 1)[0]:
+        name = file_name
+    else:
+        # 宿主只给了无后缀的名字，补上从 URL 得到的后缀，避免文件卡片没有类型。
+        name = f"{file_name}.{extension}" if extension else file_name
+    return {"url": url, "file_name": name, "file_type": file_type or FILE_FILE_TYPE}
+
+
 def _decode_base64(raw_base64: str, segment_type: str) -> bytes:
     """解码消息段里的 Base64 内容，失败时给出可读错误。"""
     try:
@@ -531,8 +569,12 @@ def _decode_base64(raw_base64: str, segment_type: str) -> bytes:
 
 
 def _file_type_from_name(file_name: str) -> Tuple[str, int]:
-    """按文件名后缀推断官方上传类型，无法判断时返回空扩展名与 0。"""
-    extension = file_name.rsplit(".", 1)[-1].lower().strip() if "." in file_name else ""
+    """按文件名后缀推断官方上传类型，无法判断时返回（真实后缀, 0）。
+
+    后缀可能来自 URL，先去掉 query 与 fragment 再取，避免 ``a.pdf?sig=...`` 取不到后缀。
+    """
+    clean_name = file_name.split("?", 1)[0].split("#", 1)[0]
+    extension = clean_name.rsplit(".", 1)[-1].lower().strip() if "." in clean_name else ""
     return extension, MEDIA_FILE_TYPE_BY_EXTENSION.get(extension, 0)
 
 

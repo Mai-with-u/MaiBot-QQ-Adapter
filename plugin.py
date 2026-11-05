@@ -18,6 +18,7 @@ from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, Messa
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .codec import (
+    FILE_FILE_TYPE,
     GROUP_EVENTS,
     PLATFORM,
     QQ_FACE_TAG_PATTERN,
@@ -1296,15 +1297,16 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
 
         二进制内容走官方推荐的分片上传：upload_prepare 取预签名分片 URL → 逐片 PUT 并
         upload_part_finish → 携带 upload_id 调用 files 合并；只有 URL 时交给平台转存，
-        避免插件自行下载任意地址。file_type 由官方定义：1 图片、2 视频、3 语音。
+        避免插件自行下载任意地址。file_type 由官方定义：1 图片、2 视频、3 语音、4 普通文件。
         """
         if binary is None:
             if not url:
                 raise RuntimeError("QQ 富媒体上传缺少文件内容（二进制或 URL）")
-            result = await self._api_post(
-                f"{base_path}/files",
-                {"file_type": file_type, "url": url, "srv_send_msg": False},
-            )
+            body: Dict[str, Any] = {"file_type": file_type, "url": url, "srv_send_msg": False}
+            if file_type == FILE_FILE_TYPE:
+                # 普通文件必须带文件名，否则客户端拿不到可读的文件卡片标题。
+                body["file_name"] = file_name
+            result = await self._api_post(f"{base_path}/files", body)
             file_info = str(result.get("file_info") or "")
             if not file_info:
                 raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
