@@ -55,6 +55,30 @@ ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 # 主动消息没有 msg_id 可依附，平台按 msg_seq 去重；每次发送取一个随机序号避免撞上默认值 1。
 PROACTIVE_MSG_SEQ_RANGE = (1, 10000)
+# 这几类错误码拒绝的是「被动回复的依附关系」，而不是消息内容本身：本地窗口还认为被动可用、
+# 平台却判定凭证已过期或次数超限时，改按主动消息重发一次仍有机会送到（见 handle_qq_official_gateway）。
+# 304103 消息 ID 已过期、40034005 回复消息 msg_id 已过期、40034024 msg_id 无效或越权、40034128 被动回复次数超限。
+PASSIVE_EXPIRED_CODES = frozenset({304103, 40034005, 40034024, 40034128})
+
+
+class QQAPIError(RuntimeError):
+    """官方 OpenAPI 返回的错误，附带平台业务错误码供调用方分流处理。"""
+
+    def __init__(self, message: str, *, code: Optional[int] = None, status: int = 0) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def _parse_api_code(result: Any) -> Optional[int]:
+    """从官方响应体里取出业务错误码；官方有时给整数，有时给字符串。"""
+    if not isinstance(result, Mapping):
+        return None
+    code = result.get("code")
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -1170,10 +1194,8 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                     )
                 # 有被动凭证就按被动回复发；没有则显式按主动消息发（带 msg_seq、不带 msg_id），
                 # 不再裸发无参请求——省略 msg_seq 会撞上平台默认值 1 而被判重复（40054005）。
-                passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
-                send_fields = passive_fields or self._proactive_fields(scene, route_target)
-                result = await self._api_post(
-                    f"{base_path}/messages", {**body, **reference_fields, **send_fields}
+                result = await self._send_part(
+                    base_path, body, reference_fields, scene, route_target, reply_to
                 )
                 if not result.get("id"):
                     raise RuntimeError("QQ 发送失败: 响应缺少消息 ID")
@@ -1282,6 +1304,41 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         )
         return {"msg_seq": sequence}
 
+    async def _send_part(
+        self,
+        base_path: str,
+        body: Mapping[str, Any],
+        reference_fields: Mapping[str, Any],
+        scene: str,
+        route_target: str,
+        reply_to: str,
+    ) -> Mapping[str, Any]:
+        """发送一条消息分片：优先被动回复，被平台判定凭证失效时改按主动消息重发一次。
+
+        被动序号在发出请求前就已占用，平台仍可能判定 msg_id 过期或次数超限（见
+        PASSIVE_EXPIRED_CODES），此时消息一条都没发出去，改按主动消息重发一次即可送达；
+        其它错误（内容违规、主动额度用尽等）原样抛出，不静默吞掉。
+        """
+        passive_fields = await self._claim_passive_fields(scene, route_target, reply_to)
+        if passive_fields:
+            try:
+                return await self._api_post(
+                    f"{base_path}/messages", {**body, **reference_fields, **passive_fields}
+                )
+            except QQAPIError as exc:
+                if exc.code not in PASSIVE_EXPIRED_CODES:
+                    raise
+                self.ctx.logger.info(
+                    "QQ 官方被动回复被平台拒绝（code=%s），改按主动消息重发: scene=%s target=%s",
+                    exc.code,
+                    scene,
+                    route_target,
+                )
+        return await self._api_post(
+            f"{base_path}/messages",
+            {**body, **reference_fields, **self._proactive_fields(scene, route_target)},
+        )
+
     async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
         session = self._require_session()
@@ -1297,12 +1354,17 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             except ValueError:
                 result = None
             if response.status >= 400 or not isinstance(result, Mapping):
+                code = _parse_api_code(result)
                 detail = (
                     f"code={result.get('code')} message={result.get('message')}"
                     if isinstance(result, Mapping)
                     else text[:200]
                 )
-                raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
+                raise QQAPIError(
+                    f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}",
+                    code=code,
+                    status=response.status,
+                )
         return result
 
     async def _upload_image(self, base_path: str, binary: bytes, file_name: str) -> str:
