@@ -52,6 +52,10 @@ DEFAULT_UPLOAD_CONCURRENCY = 1
 MAX_UPLOAD_CONCURRENCY = 4
 DEFAULT_UPLOAD_RETRY_TIMEOUT = 30.0
 DEFAULT_UPLOAD_RETRY_DELAY = 1.0
+# 富媒体传输必须覆盖会话的 20 秒总超时：分片 PUT 沿用官方文档建议的 300 秒，
+# 本机/内网取回按 socket 空闲 60 秒限流，否则大文件会被总超时提前掐断。
+PART_UPLOAD_TIMEOUT_SEC = 300.0
+LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC = 60.0
 TRUSTED_QQ_MEDIA_HOSTS = frozenset({"grouppro.grouppro.qq.com"})
 TRUSTED_QQ_MEDIA_HOST_SUFFIXES = ("nt.qq.com", "nt.qq.com.cn", "ugcimg.cn")
 ID_MAP_FILE_NAME = "id_map.json"
@@ -1270,14 +1274,27 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             self._replies[key] = (received_at, sequence)
             return {"msg_id": key[2], "msg_seq": sequence}
 
-    async def _api_post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。"""
+    async def _api_post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        timeout: Optional[float] = None,
+    ) -> Mapping[str, Any]:
+        """调用官方 OpenAPI（POST），HTTP 错误时带上平台错误码与说明抛出。
+
+        ``timeout`` 只给富媒体上传接口用：预上传要算校验值、合并要服务端拼装完整文件，
+        几十上百 MB 的文件都会超过会话默认的 20 秒总超时。
+        """
         session = self._require_session()
         token = await self._authorize()
+        request_options: Dict[str, Any] = {}
+        if timeout is not None:
+            request_options["timeout"] = ClientTimeout(total=timeout)
         async with session.post(
             self._api_url(path),
             headers={"Authorization": f"QQBot {token}"},
             json=dict(payload),
+            **request_options,
         ) as response:
             text = await response.text()
             try:
@@ -1319,7 +1336,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 if file_type == FILE_FILE_TYPE:
                     # 普通文件必须带文件名，否则客户端拿不到可读的文件卡片标题。
                     body["file_name"] = file_name
-                result = await self._api_post(f"{base_path}/files", body)
+                result = await self._api_post(f"{base_path}/files", body, timeout=PART_UPLOAD_TIMEOUT_SEC)
                 file_info = str(result.get("file_info") or "")
                 if not file_info:
                     raise RuntimeError("QQ 富媒体上传响应缺少 file_info")
@@ -1334,6 +1351,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 "sha1": sha1(binary).hexdigest(),
                 "md5_10m": md5(binary[:MD5_10M_BYTES]).hexdigest(),
             },
+            timeout=PART_UPLOAD_TIMEOUT_SEC,
         )
         upload_id = str(prepare.get("upload_id") or "")
         block_size = int(prepare.get("block_size") or 0)
@@ -1367,6 +1385,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         result = await self._api_post(
             f"{base_path}/files",
             {"file_type": file_type, "srv_send_msg": False, "file_name": file_name, "upload_id": upload_id},
+            timeout=PART_UPLOAD_TIMEOUT_SEC,
         )
         file_info = str(result.get("file_info") or "")
         if not file_info:
@@ -1417,8 +1436,11 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         deadline = time.monotonic() + retry_timeout
         while True:
             try:
-                # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头。
-                async with session.put(presigned_url, data=chunk) as response:
+                # 预签名 URL 自带鉴权，不能携带 QQBot Authorization 头；会话默认的 20 秒总超时
+                # 会让大分片在慢网下被提前掐断，这里按官方建议的单次上传超时覆盖。
+                async with session.put(
+                    presigned_url, data=chunk, timeout=ClientTimeout(total=PART_UPLOAD_TIMEOUT_SEC)
+                ) as response:
                     if response.status >= 400:
                         raise RuntimeError(f"QQ 富媒体分片 {index} 上传失败: HTTP {response.status}")
                 await self._api_post(
@@ -1441,7 +1463,10 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         """取回本机转存地址的富媒体字节，用于自己走分片上传。"""
         session = self._require_session()
         try:
-            async with session.get(url) as response:
+            # 本机转存可能耗时较久（大文件 + 限速），只限制 socket 空闲超时而不是总时长。
+            async with session.get(
+                url, timeout=ClientTimeout(total=None, sock_read=LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC)
+            ) as response:
                 if response.status >= 400:
                     raise RuntimeError(f"宿主附件转存失败: HTTP {response.status}")
                 if response.content_length and response.content_length > MAX_OUTBOUND_MEDIA_BYTES:

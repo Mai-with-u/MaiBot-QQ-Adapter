@@ -3,9 +3,13 @@ import base64
 import time
 
 import pytest
-from aiohttp import ClientConnectionError
+from aiohttp import ClientConnectionError, ClientTimeout
 
-from qq_official_adapter.plugin import QQOfficialAdapterPlugin
+from qq_official_adapter.plugin import (
+    LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC,
+    PART_UPLOAD_TIMEOUT_SEC,
+    QQOfficialAdapterPlugin,
+)
 
 GROUP_OPENID = "group-openid"
 REPLY_ID = "ROBOT1.0_reply"
@@ -81,6 +85,8 @@ class _FakeSession:
         self.puts = []
         self.local_body = local_body
         self.gets = []
+        # 各接口收到的请求选项，用于断言富媒体上传覆盖了会话默认的 20 秒总超时。
+        self.api_options = []
         # 前若干次 PUT 抛网络异常，用于验证按官方 upload_config 下发的策略重试。
         self.put_failures = put_failures
         self.in_flight = 0
@@ -121,8 +127,10 @@ async def _make_plugin(
     upload_parts = parts if parts is not None else [{"index": 1, "presigned_url": "https://upload.example/1"}]
     fake_block_size = block_size or len(PNG)
 
-    async def _fake_api_post(path, payload):
+    async def _fake_api_post(path, payload, **kwargs):
         captured.append((path, dict(payload)))
+        # 记录每个接口收到的请求选项，用于断言富媒体上传覆盖了会话默认超时。
+        session.api_options.append((path, kwargs))
         if path.endswith("/upload_prepare"):
             prepare = {
                 "upload_id": "UPLOAD1",
@@ -442,4 +450,28 @@ async def test_part_put_retries_on_network_error() -> None:
     assert result["success"] is True
     # 第一次抛连接错误，重试后成功落片。
     assert len(session.puts) == 2
+    assert _post_payload(captured, "/messages")["media"]["file_info"] == FILE_INFO
+
+
+@pytest.mark.asyncio
+async def test_media_transfer_overrides_session_timeout() -> None:
+    # 会话默认总超时只有 20 秒，大文件的分片 PUT 与本机取回都会超时，必须逐请求覆盖。
+    plugin, captured, session = await _make_plugin(local_body=PNG)
+    message = _media_message(
+        {"type": "file", "data": {"name": "report.png", "url": "http://127.0.0.1:8001/api/files/transfers/t1"}}
+    )
+    result = await plugin.handle_qq_official_gateway(message)
+    assert result["success"] is True
+    put_timeout = session.puts[0][1]["timeout"]
+    assert isinstance(put_timeout, ClientTimeout)
+    assert put_timeout.total == PART_UPLOAD_TIMEOUT_SEC
+    get_timeout = session.gets[0][1]["timeout"]
+    assert isinstance(get_timeout, ClientTimeout)
+    # 取回本机附件不限总时长，只限制 socket 空闲，避免大文件被总超时掐断。
+    assert get_timeout.total is None
+    assert get_timeout.sock_read == LOCAL_MEDIA_SOCK_READ_TIMEOUT_SEC
+    # 预上传与合并都是重接口，同样按上传超时下发。
+    upload_option_paths = [path for path, options in session.api_options if options.get("timeout")]
+    assert any(path.endswith("/upload_prepare") for path in upload_option_paths)
+    assert any(path.endswith("/files") for path in upload_option_paths)
     assert _post_payload(captured, "/messages")["media"]["file_info"] == FILE_INFO
