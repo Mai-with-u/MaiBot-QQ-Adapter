@@ -86,7 +86,7 @@ class PrivateMenuItem(PluginConfigBase):
     sub_items: List[str] = Field(
         default_factory=list,
         description="仅「二级菜单」类型生效，最多 5 项，每项为点击后填入输入框的指令；二级菜单不支持再嵌套",
-        json_schema_extra={"label": "二级菜单项（仅「二级菜单」类型）", "max_items": 5},
+        json_schema_extra={"label": "二级菜单项（仅「二级菜单」类型）"},
     )
 
 
