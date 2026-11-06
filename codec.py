@@ -32,11 +32,15 @@ def decode_message(
     bot_name: str = "",
     id_map: Optional[Mapping[str, Mapping[str, str]]] = None,
     unified_account_id: str = "",
+    group_name: str = "",
 ) -> Tuple[Dict[str, Any], str, str]:
     """将官方群 @/全量群/单聊事件转换为 MaiBot 网关消息，并返回场景和目标 OpenID。
 
     附件由插件侧下载并转换为标准段后经 ``attachment_segments``/``attachment_labels``
     传入；没有文本但有附件段的消息同样放行。
+
+    ``group_name`` 由插件侧查询群基本信息接口后传入：官方消息事件本身不带群名，
+    取不到时传空串，主程序会保留聊天流里已记录的真实群名。
     """
     if event_type not in SUPPORTED_EVENTS:
         raise ValueError(f"不支持的事件类型: {event_type}")
@@ -110,8 +114,9 @@ def decode_message(
     if is_group:
         message_info["group_info"] = {
             "group_id": group_id,
-            # 官方事件通常不带群名；传空表示未知，聊天流保留已记录的真实群名
-            "group_name": str(payload.get("group_name") or ""),
+            # 官方事件通常不带群名，改由插件查 group_openid 的群基本信息补齐；
+            # 两者都没有时传空表示未知，聊天流保留已记录的真实群名。
+            "group_name": str(group_name or payload.get("group_name") or ""),
         }
 
     raw_message: List[Dict[str, Any]] = [*body_segments, *segments]
