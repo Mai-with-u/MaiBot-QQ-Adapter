@@ -52,6 +52,8 @@ MUTE_TOOL_NAME = "mute"
 RECALL_TOOL_NAME = "recall_message"
 ASSIGN_COMMANDS = frozenset({ASSIGN_GROUP_COMMAND, ASSIGN_USER_COMMAND})
 ASSIGN_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 群基本信息接口短时缓存，避免每条群消息都消耗 30 QPM 的配额。
+GROUP_NAME_TTL_SEC = 3600.0
 
 
 class QQOfficialAdapterPlugin(MaiBotPlugin):
@@ -127,6 +129,9 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         self._qr_login = QRLogin(self._apply_qr_credentials)
         self._gateway_state_lock = asyncio.Lock()
         self._inbound_ready = asyncio.Event()
+        # group_openid（或统一群号）→ (群名, 拉取时间)，避免每条群消息都打群基本信息接口。
+        self._group_names: Dict[str, Tuple[str, float]] = {}
+        self._group_name_lock = asyncio.Lock()
 
     async def on_load(self) -> None:
         # 页面在连接关闭或凭据尚未填写时也需要展示已有绑定。
@@ -224,6 +229,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
         await self._disconnect()
         self._replies.clear()
         self._ref_idx.clear()
+        self._group_names.clear()
         self._session_id = ""
         self._seq = None
         self._account_id = ""
@@ -455,6 +461,27 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
             raise RuntimeError("QQ 官方适配器 HTTP 会话未就绪")
         return self._session
 
+    async def _api_get(self, path: str) -> Mapping[str, Any]:
+        """调用官方 OpenAPI 的 GET 接口，失败时抛出带错误码的 RuntimeError。"""
+        session = self._require_session()
+        token = await self._authorize()
+        async with session.get(self._api_url(path), headers={"Authorization": f"QQBot {token}"}) as response:
+            text = await response.text()
+        try:
+            result = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError:
+            result = {}
+        if response.status >= 400:
+            detail = (
+                f"code={result.get('code')} message={result.get('message')}"
+                if isinstance(result, Mapping) and result.get("code") is not None
+                else text[:200]
+            )
+            raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 失败: HTTP {response.status} {detail}")
+        if not isinstance(result, Mapping):
+            raise RuntimeError(f"QQ 接口 {path.rsplit('/', 1)[-1]} 返回格式异常: {text[:200]}")
+        return result
+
     def _invalidate_token(self) -> None:
         self._access_token = ""
         self._token_expires_at = 0.0
@@ -608,6 +635,12 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 await self._handle_assign_command(command, event, data)
                 return
             segments, labels, is_picture, is_emoji = await self._build_attachments(data)
+            # 官方消息事件不带群名，按 group_openid 查群基本信息补齐；查不到则保持空串。
+            group_name = ""
+            if event in GROUP_EVENTS:
+                group_openid = str(data.get("group_openid") or "").strip()
+                if group_openid:
+                    group_name = await self._get_group_name(group_openid)
             message, scene, target = decode_message(
                 event,
                 data,
@@ -619,6 +652,7 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 bot_name=bot_name,
                 id_map=self._id_map,
                 unified_account_id=self._unified_account_id,
+                group_name=group_name,
             )
         except ValueError as exc:
             self.ctx.logger.info("忽略 QQ 官方消息: %s | payload=%s", exc, summarize_payload(data))
@@ -858,6 +892,31 @@ class QQOfficialAdapterPlugin(MaiBotPlugin):
                 return openid
         # 未绑定的用户 user_id 本身就是 OpenID；纯数字是无法反查的 QQ 号。
         return "" if user_id.isdigit() else user_id
+
+    async def _get_group_name(self, group_openid: str) -> str:
+        """按 group_openid 查群名，带进程内短时缓存；失败只降级为未知，不影响消息投递。"""
+        if not group_openid:
+            return ""
+        now = time.time()
+        async with self._group_name_lock:
+            cached = self._group_names.get(group_openid)
+            if cached is not None and now - cached[1] < GROUP_NAME_TTL_SEC:
+                return cached[0]
+        name = ""
+        try:
+            info = await self._api_get(f"/v2/groups/{quote(group_openid, safe='')}/info")
+            name = str(info.get("group_name") or "").strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 该接口仅对白名单机器人开放（无权限时为 11253）；未开通时保持群名未知。
+            # 失败与空群名同样缓存 TTL，避免每条群消息都重试。
+            self.ctx.logger.info("获取 QQ 群名称失败，本次按未知处理: group_openid=%s | %s", group_openid, exc)
+        async with self._group_name_lock:
+            self._group_names[group_openid] = (name, now)
+        if name:
+            self.ctx.logger.info("QQ 群名称已更新: group_openid=%s name=%s", group_openid, name)
+        return name
 
     @API("adapter.avatar.get", description="获取独立用户或群头像资源", version="1", public=True)
     async def api_get_avatar(
